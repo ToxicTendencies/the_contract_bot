@@ -24,7 +24,6 @@ STATE_OPEN = "open"
 # печать. Готовым контракт считается только после печати.
 STATE_SEAL = "seal"
 STATE_SIGNED = "signed"
-STATE_CLOSED = "closed"
 
 TOKEN_LENGTH = 8
 MAX_TERMS_REVISIONS = 10
@@ -37,7 +36,6 @@ class Signature:
     user_id: int
     user_name: str = ""
     user_username: str = ""
-    at: float = 0.0
 
 
 @dataclass
@@ -85,7 +83,6 @@ class TermsRevision:
     text: str
     user_id: int = 0
     user_name: str = ""
-    at: float = 0.0
 
 
 @dataclass
@@ -105,29 +102,22 @@ class Contract:
     terms_author_name: str = ""
     terms_revisions: list[TermsRevision] = field(default_factory=list)
     blank_file_id: str | None = None
-    # Дата на бланке: автоматическая или вписанная вручную.
+    # Дата на бланке: по умолчанию — из сообщения, которым вызвали бота.
+    # date_default хранит её, чтобы слово «авто» вернуло исходную.
     date_text: str | None = None
-    date_auto: bool = True
-    date_user_id: int = 0
+    date_default: str = ""
     # Создатель подтвердил дату после подписей — можно ставить печать.
     date_confirmed: bool = False
-    # Печать: кто и когда поставил.
-    stamp_user_id: int = 0
     stamped_at: float = 0.0
     initiator_id: int = 0
     initiator_name: str = ""
     state: str = STATE_PREVIEW
     page: int = 0
-    created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
     signatures: dict[str, Signature] = field(default_factory=dict)
 
     def touch(self) -> None:
         self.updated_at = time.time()
-
-    @property
-    def is_complete(self) -> bool:
-        return self.state == STATE_SIGNED
 
     @property
     def is_stamped(self) -> bool:
@@ -167,7 +157,6 @@ class ContractStore:
         self.max_per_chat = 5
         self._by_token: dict[str, Contract] = {}
         self._chat_tokens: dict[str, list[str]] = {}
-        self._by_inline: dict[str, str] = {}
         # Один человек может подписывать контракты в нескольких чатах сразу,
         # поэтому ожидание ввода привязано к контракту, а не только к юзеру.
         self._pending: dict[tuple[int, str], PendingSignature] = {}
@@ -192,12 +181,6 @@ class ContractStore:
             if contract is not None:
                 return contract
         return None
-
-    def for_inline(self, inline_message_id: str | None) -> Contract | None:
-        if not inline_message_id:
-            return None
-        token = self._by_inline.get(inline_message_id)
-        return self._by_token.get(token) if token else None
 
     def open_for_chat(self, chat_key: str) -> Contract | None:
         """Незавершённый контракт чата: его продолжают новым сообщением."""
@@ -440,13 +423,12 @@ class ContractStore:
             initiator_name=initiator_name,
             page=page,
             date_text=date_text or None,
+            date_default=date_text or "",
         )
         self._by_token[token] = contract
         if chat_key:
             self._chat_tokens.setdefault(chat_key, []).append(token)
             self._trim_chat(chat_key)
-        if inline_message_id:
-            self._by_inline[inline_message_id] = token
         self._enforce_cap()
         return contract
 
@@ -463,18 +445,8 @@ class ContractStore:
             self.drop(self._by_token[victim])
 
     def bind_inline(self, contract: Contract, inline_message_id: str) -> None:
-        if (
-            contract.inline_message_id
-            and contract.inline_message_id != inline_message_id
-        ):
-            self._by_inline.pop(contract.inline_message_id, None)
         contract.inline_message_id = inline_message_id
-        self._by_inline[inline_message_id] = contract.token
         contract.touch()
-
-    def unbind_inline(self, inline_message_id: str | None) -> None:
-        if inline_message_id:
-            self._by_inline.pop(inline_message_id, None)
 
     def bind_message(
         self,
@@ -485,7 +457,6 @@ class ContractStore:
         chat_key: str | None = None,
     ) -> None:
         """Переключить правки на обычное сообщение бота (бот в чате)."""
-        self.unbind_inline(contract.inline_message_id)
         contract.inline_message_id = None
         contract.chat_id = chat_id
         contract.message_id = message_id
@@ -501,11 +472,6 @@ class ContractStore:
                 tokens.remove(contract.token)
             if not tokens:
                 self._chat_tokens.pop(contract.chat_key, None)
-        if (
-            contract.inline_message_id
-            and self._by_inline.get(contract.inline_message_id) == contract.token
-        ):
-            self._by_inline.pop(contract.inline_message_id, None)
         self.clear_pending(token=contract.token)
         self.clear_pending_terms(token=contract.token)
         self.clear_pending_date(token=contract.token)
@@ -521,11 +487,6 @@ class ContractStore:
                 dropped.append(contract)
                 self.drop(contract)
         return dropped
-
-    def drop_token(self, token: str | None) -> None:
-        contract = self.get(token)
-        if contract:
-            self.drop(contract)
 
     # -- pending input ---------------------------------------------------
 
@@ -544,7 +505,6 @@ class ContractStore:
                     text=contract.terms,
                     user_id=contract.terms_author_id,
                     user_name=contract.terms_author_name,
-                    at=time.time(),
                 )
             )
             # Контракт живёт час: больше десятка редакций за это время —
@@ -565,7 +525,6 @@ class ContractStore:
         """
         contract.signatures.clear()
         contract.date_confirmed = False
-        contract.stamp_user_id = 0
         contract.stamped_at = 0.0
         if contract.state in {STATE_SEAL, STATE_SIGNED}:
             contract.state = STATE_OPEN
@@ -574,9 +533,8 @@ class ContractStore:
         self.clear_pending_date(token=contract.token)
         contract.touch()
 
-    def mark_stamped(self, contract: Contract, user_id: int) -> None:
+    def mark_stamped(self, contract: Contract) -> None:
         """Печать поставлена: контракт готов, менять в нём нечего."""
-        contract.stamp_user_id = user_id
         contract.stamped_at = time.time()
         contract.state = STATE_SIGNED
         self.clear_pending(token=contract.token)
@@ -710,7 +668,6 @@ class ContractStore:
             user_id=user_id,
             user_name=user_name,
             user_username=user_username,
-            at=time.time(),
         )
         contract.signatures[field_key] = signature
         self.clear_pending(user_id, contract.token)
@@ -749,7 +706,6 @@ class ContractStore:
     def clear(self) -> None:
         self._by_token.clear()
         self._chat_tokens.clear()
-        self._by_inline.clear()
         self._pending.clear()
         self._terms_pending.clear()
         self._date_pending.clear()

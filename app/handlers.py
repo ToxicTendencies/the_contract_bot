@@ -27,7 +27,7 @@ from aiogram.types import CallbackQuery, Message, User
 
 from . import ui
 from .config import TemplateConfig
-from .render import default_date, validate_date, validate_signature, validate_terms
+from .render import moment_text, validate_date, validate_signature, validate_terms
 from .store import (
     STATE_PREVIEW,
     STATE_SEAL,
@@ -48,8 +48,9 @@ log = logging.getLogger(__name__)
 Say = Callable[[str], Awaitable[None]]
 
 
-def _sender(message: Message) -> User | None:
-    return message.from_user or message.guest_bot_caller_user
+def _message_date(app: "App", message: Message) -> str:
+    """Дата контракта — момент отправки сообщения, которым вызвали бота."""
+    return moment_text(getattr(message, "date", None), app.settings.dates)
 
 
 def split_mention(text: str, username: str) -> tuple[str, bool]:
@@ -402,11 +403,10 @@ async def handle_date_text(
     text: str,
     say: Say,
     contract: Contract,
-    pending: PendingDate,
     *,
     ignore_chat: bool = False,
 ) -> None:
-    """Вписать дату вручную или вернуть автоматическую словом «авто».
+    """Вписать дату вручную или вернуть дату из сообщения словом «авто».
 
     Дату вписывают только после всех подписей, и только создатель контракта:
     это подтверждение перед печатью.
@@ -443,11 +443,11 @@ async def handle_date_text(
         return
 
     value = text.strip()
-    auto = value.lower() in {"авто", "auto", "сегодня"}
+    auto = value.lower() in {"авто", "auto"}
     if auto:
-        contract.date_text = default_date(app.settings.dates)
-        contract.date_auto = True
-        contract.date_user_id = 0
+        contract.date_text = contract.date_default or moment_text(
+            None, app.settings.dates
+        )
         message_text = app.config.text(
             "guest.date_auto", date=html.escape(contract.date_text or "")
         )
@@ -462,8 +462,6 @@ async def handle_date_text(
             await say(app.config.text(error, length=check.length, max_length=check.max_length))
             return
         contract.date_text = check.text
-        contract.date_auto = False
-        contract.date_user_id = user.id
         message_text = app.config.text(
             "guest.date_set", date=html.escape(contract.date_text or "")
         )
@@ -634,7 +632,6 @@ async def handle_chat_message(app: "App", message: Message) -> None:
                 text,
                 say,
                 contract_for_date,
-                date_pending,
                 ignore_chat=date_loose,
             )
             return
@@ -747,7 +744,6 @@ async def handle_chat_message(app: "App", message: Message) -> None:
                         query,
                         say,
                         contract_for_date,
-                        date_pending,
                         ignore_chat=date_loose,
                     )
                     return
@@ -818,7 +814,7 @@ async def handle_chat_message(app: "App", message: Message) -> None:
         initiator_id=user.id,
         initiator_name=_user_name(user),
         page=app.index_of(template.key),
-        date_text=default_date(app.settings.dates),
+        date_text=_message_date(app, message),
     )
     if template.has_terms:
         contract.terms_user_id = user.id
@@ -1212,9 +1208,7 @@ async def _handle_stamp(app: "App", query: CallbackQuery, token: str) -> None:
         await query.answer(app.config.text("callback.date_first"))
         return
 
-    ok = await app.finalize(
-        contract, template, stamp=True, user_id=query.from_user.id
-    )
+    ok = await app.finalize(contract, template, stamp=True)
     app.note(
         f"stamped token={contract.token} user={query.from_user.id} ok={ok}"
     )

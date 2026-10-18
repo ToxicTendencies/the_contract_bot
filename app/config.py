@@ -19,7 +19,6 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable
-from zoneinfo import ZoneInfo
 
 import yaml
 from dotenv import load_dotenv
@@ -87,18 +86,6 @@ def _as_float(value: Any, name: str, *, minimum: float | None = None,
     return result
 
 
-def _as_bool(value: Any, name: str) -> bool:
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, str):
-        lowered = value.strip().lower()
-        if lowered in {"1", "true", "yes", "on", "да"}:
-            return True
-        if lowered in {"0", "false", "no", "off", "нет"}:
-            return False
-    raise ConfigError(f"{name}: ожидалось true/false, получено {value!r}")
-
-
 def _resolve_path(value: str | os.PathLike[str]) -> Path:
     path = Path(value).expanduser()
     return path if path.is_absolute() else (BASE_DIR / path)
@@ -163,9 +150,8 @@ class StorageSettings:
 
 @dataclass(frozen=True)
 class DateSettings:
-    """Как бот понимает «сегодня» и в каком виде печатает дату."""
+    """В каком виде печатать дату. Сама дата — из сообщения вызывающего."""
 
-    timezone: str = "Europe/Moscow"
     format: str = "%d.%m.%Y"
 
 
@@ -280,13 +266,8 @@ def load_settings(
         file_ids_file=str(storage_cfg_raw.get("file_ids_file", "file_ids.json")),
     )
 
-    timezone = str(dates_raw.get("timezone", "Europe/Moscow")).strip() or "Europe/Moscow"
-    try:
-        ZoneInfo(timezone)
-    except Exception as exc:  # noqa: BLE001 - ZoneInfo raises several types
-        raise ConfigError(f"dates.timezone: неизвестный часовой пояс {timezone!r}") from exc
     date_format = str(dates_raw.get("format", "%d.%m.%Y")).strip() or "%d.%m.%Y"
-    dates = DateSettings(timezone=timezone, format=date_format)
+    dates = DateSettings(format=date_format)
 
     log_level = (os.getenv("LOG_LEVEL") or logging_raw.get("level") or "INFO").upper()
     if log_level not in {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}:

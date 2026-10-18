@@ -12,9 +12,8 @@ contract:
   cleanup_interval_seconds: 30
 
 dates:
-  # Часовой пояс, по которому бот считает «сегодня».
-  timezone: Europe/Moscow
-  # Формат даты на бланке (strftime).
+  # Формат даты на бланке (strftime). Сама дата — момент отправки
+  # сообщения, которым вызвали бота, по часам машины.
   format: "%d.%m.%Y"
 
 limits:

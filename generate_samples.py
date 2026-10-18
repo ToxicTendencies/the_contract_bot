@@ -389,7 +389,11 @@ def load_everything(templates_path: Path, texts_path: Path):
         format=str(dates_raw.get("format", "%d.%m.%Y")),
     )
     warnings: list[str] = []
-    templates = load_templates(templates_path, limits, warnings=warnings)
+    custom_path = templates_path.parent / "custom_templates.yaml"
+    extra_paths = [custom_path] if custom_path.exists() else []
+    templates = load_templates(
+        templates_path, limits, warnings=warnings, extra_paths=extra_paths
+    )
     texts = {}
     if texts_path.exists():
         texts = yaml.safe_load(texts_path.read_text(encoding="utf-8")) or {}

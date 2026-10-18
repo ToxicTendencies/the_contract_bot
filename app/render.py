@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import logging
+from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -47,7 +48,10 @@ class RenderError(RuntimeError):
 
 _font_cache: dict[tuple[str, int], ImageFont.FreeTypeFont] = {}
 _image_cache: dict[str, tuple[int, Image.Image]] = {}
-_canvas_cache: dict[str, tuple[tuple, Image.Image]] = {}
+# Собранные холсты (свой фон + рамка) — только они: готовый бланк уже лежит
+# в _image_cache, второй копией его держать незачем (6.5 МБ на бланк).
+_canvas_cache: OrderedDict[str, tuple[tuple, Image.Image]] = OrderedDict()
+_CANVAS_CACHE_LIMIT = 3
 
 
 def clear_caches() -> None:
@@ -79,11 +83,11 @@ def format_date(dates: DateConfig, value: str) -> str:
     return dates.fmt.replace("{date}", value).strip()
 
 
-def validate_date(text: str, dates: DateConfig, limits: Limits) -> SignatureCheck:
+def validate_date(text: str, dates: DateConfig) -> SignatureCheck:
     """Проверить ручную дату: не пусто, не длинно, влезает в свой блок."""
     normalized = normalize_text(text)
     length = count_graphemes(normalized)
-    max_length = min(dates.style.max_length, limits.signature_hard_cap)
+    max_length = dates.style.max_length
 
     if not normalized:
         return SignatureCheck(False, normalized, 0, max_length, "empty")
@@ -163,15 +167,19 @@ def _fit_background(size: tuple[int, int], background: BackgroundConfig) -> Imag
     except Exception as exc:  # noqa: BLE001
         raise RenderError(f"Не удалось открыть фон {background.image}: {exc}") from exc
 
-    if background.blur > 0:
-        source = source.filter(ImageFilter.GaussianBlur(background.blur))
-
+    # Сначала уменьшаем, потом размываем: GaussianBlur по исходнику 4000×3000
+    # в разы дороже, чем по готовому холсту.
     if background.fit == "stretch":
         fitted = source.resize(size, Image.LANCZOS)
     elif background.fit == "contain":
         fitted = ImageOps.pad(source, size, method=Image.LANCZOS, color=(255, 255, 255))
+    elif source.size == size:
+        fitted = source
     else:  # cover — заполнить холст целиком, лишнее обрезать
         fitted = ImageOps.fit(source, size, method=Image.LANCZOS)
+
+    if background.blur > 0:
+        fitted = fitted.filter(ImageFilter.GaussianBlur(background.blur))
 
     if background.dim > 0:
         black = Image.new("RGB", size, (0, 0, 0))
@@ -232,24 +240,44 @@ def _draw_frame(canvas: Image.Image, frame: FrameConfig) -> None:
             draw.line([(x, y), (x, y + dy * length)], fill=frame.color, width=thick)
 
 
+def _remember_canvas(key: str, fingerprint: tuple, canvas: Image.Image) -> None:
+    """Положить холст в LRU-кэш: своих бланков немного, но RAM не бесконечна."""
+    cache_key = f"{key}:{fingerprint}"
+    _canvas_cache[cache_key] = (fingerprint, canvas.copy())
+    _canvas_cache.move_to_end(cache_key)
+    while len(_canvas_cache) > _CANVAS_CACHE_LIMIT:
+        _canvas_cache.popitem(last=False)
+
+
 def build_canvas(template: TemplateConfig) -> Image.Image:
     """Собрать бланк: готовый файл или холст с фоном и рамкой.
 
-    Результат кэшируется по mtime всех файлов и настройкам, а наружу отдаётся
-    копия: рисование подписей не должно портить кэш.
+    Готовый файл без рамки отдаётся напрямую из кэша картинок. Собранный холст
+    (фон, рамка) кэшируется по mtime файлов и настройкам; наружу всегда уходит
+    копия, чтобы рисование подписей не портило кэш.
     """
     background = template.background
     frame = template.frame
+
+    if template.file is not None and frame is None:
+        if background is not None:
+            log.warning(
+                "Бланк %s: background не применяется к готовому файлу", template.key
+            )
+        return load_template_image(template.file)
+
     fingerprint = (
         _path_stamp(template.file),
         _path_stamp(background.image if background else None),
         _path_stamp(frame.image if frame else None),
-        repr(background),
-        repr(frame),
+        background,
+        frame,
         tuple(template.canvas),
     )
-    cached = _canvas_cache.get(template.key)
-    if cached is not None and cached[0] == fingerprint:
+    cache_key = f"{template.key}:{fingerprint}"
+    cached = _canvas_cache.get(cache_key)
+    if cached is not None:
+        _canvas_cache.move_to_end(cache_key)
         return cached[1].copy()
 
     if template.file is not None:
@@ -266,7 +294,7 @@ def build_canvas(template: TemplateConfig) -> Image.Image:
     if frame is not None:
         _draw_frame(canvas, frame)
 
-    _canvas_cache[template.key] = (fingerprint, canvas.copy())
+    _remember_canvas(template.key, fingerprint, canvas)
     return canvas
 
 
@@ -590,17 +618,9 @@ def render_contract(
     image = build_canvas(template)
     draw = ImageDraw.Draw(image)
 
-    date_blocks: list[tuple[DateConfig, str]] = []
-    if date and template.dates is not None:
-        date_blocks.append((template.dates, date))
-    if date:
-        date_blocks.extend(
-            (field.date, date)
-            for field in template.fields.values()
-            if field.date is not None
-        )
-    for dates, value in date_blocks:
-        text = format_date(dates, value)
+    date_blocks = template.date_blocks if date else ()
+    for dates in date_blocks:
+        text = format_date(dates, date or "")
         layout = layout_text(
             text, dates.box, dates.style, max_lines=dates.style.max_lines
         )
@@ -668,7 +688,7 @@ def render_contract(
 
 def debug_image(template: TemplateConfig, *, draw_samples: bool = True) -> Image.Image:
     """Return a copy with field boxes and labels for manual tuning."""
-    image = load_template_image(template.file)
+    image = build_canvas(template)
     draw = ImageDraw.Draw(image)
     label_font = _load_font(DEFAULT_FONT, 22)
     label_color = (200, 30, 30)

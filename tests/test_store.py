@@ -286,11 +286,10 @@ def test_pending_date_is_exclusive():
     contract = store.create(chat_key="g1", template_key="classic", initiator_id=10)
 
     store.set_pending(10, contract, "party1")
-    date_pending = store.set_pending_date(10, contract, return_state=STATE_PREVIEW)
+    date_pending = store.set_pending_date(10, contract)
     assert store.pending_for(10, token=contract.token) is None
     assert store.pending_terms_for(10, token=contract.token) is None
     assert store.pending_date_for(10, token=contract.token) is date_pending
-    assert date_pending.return_state == STATE_PREVIEW
     assert store.pending_count == 1
 
     # Подпись отменяет ожидание даты.

@@ -407,7 +407,8 @@ async def handle_date_text(
         app.store.clear_pending_date(user.id, contract.token)
         await say(app.config.text("guest.contract_expired", bot=app.bot_username))
         return
-    if template.dates is None:
+    rule = template.date_rule
+    if rule is None:
         app.store.clear_pending_date(user.id, contract.token)
         await say(app.config.text("callback.no_dates"))
         return
@@ -430,9 +431,11 @@ async def handle_date_text(
         contract.date_text = default_date(app.settings.dates)
         contract.date_auto = True
         contract.date_user_id = 0
-        message_text = app.config.text("guest.date_auto", date=contract.date_text)
+        message_text = app.config.text(
+            "guest.date_auto", date=html.escape(contract.date_text or "")
+        )
     else:
-        check = validate_date(value, template.dates, app.settings.limits)
+        check = validate_date(value, rule)
         if not check.ok:
             error = {
                 "empty": "guest.date_empty",
@@ -451,8 +454,9 @@ async def handle_date_text(
     contract.touch()
     app.store.clear_pending_date(user.id, contract.token)
     # Условия уже напечатаны на картинке — перерисуем их с новой датой.
+    # Прежний file_id не сбрасываем: если загрузка не удастся, карточка
+    # останется с прежней картинкой, а не с бланком без условий.
     if template.terms is not None and contract.terms:
-        contract.blank_file_id = None
         ok = await app.show_terms_contract(contract, template)
     elif contract.state == STATE_PREVIEW:
         ok = await app.show_preview_page(contract, contract.page)
@@ -1095,7 +1099,10 @@ async def _handle_date_press(app: "App", query: CallbackQuery, token: str) -> No
         return
 
     template = app.template_or_first(contract.template_key)
-    if template is None or template.dates is None:
+    if template is None:
+        await query.answer(_callback_expired(app))
+        return
+    if not template.uses_dates:
         await query.answer(app.config.text("callback.no_dates"))
         return
     if contract.state == STATE_SIGNED:
@@ -1107,9 +1114,7 @@ async def _handle_date_press(app: "App", query: CallbackQuery, token: str) -> No
         await query.answer(app.config.text("callback.terms_changing"))
         return
 
-    app.store.set_pending_date(
-        query.from_user.id, contract, return_state=contract.state
-    )
+    app.store.set_pending_date(query.from_user.id, contract)
     ok = await app.show_date_prompt(contract, template)
     app.note(f"date prompt token={contract.token} user={query.from_user.id}")
     await query.answer("" if ok else app.config.text("errors.generic"))

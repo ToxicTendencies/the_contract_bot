@@ -105,3 +105,18 @@ def test_every_template_fits_callback_limit(app):
             for row in markup.inline_keyboard:
                 for button in row:
                     assert len(button.callback_data.encode()) <= 64
+
+
+def test_no_date_button_when_template_has_no_dates(app):
+    from app import ui
+
+    assert ui.date_button(app.config, "abcdefgh", "") is None
+    markup = ui.preview_markup(app.config, "abcdefgh", 0, 5, date="")
+    keys = [button.callback_data for row in markup.inline_keyboard for button in row]
+    assert all(not key.startswith("dt:") for key in keys)
+
+    with_date = ui.preview_markup(
+        app.config, "abcdefgh", 0, 5, date="18.10.2026"
+    )
+    keys = [button.callback_data for row in with_date.inline_keyboard for button in row]
+    assert keys[-1] == "dt:abcdefgh"

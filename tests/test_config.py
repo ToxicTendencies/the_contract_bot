@@ -175,7 +175,8 @@ def test_dates_are_parsed_for_every_template(config):
     for key in ("classic", "minimal", "dark", "medieval", "free"):
         template = config.templates.get(key)
         assert template is not None
-        assert template.has_dates
+        assert template.uses_dates
+        assert template.date_rule is not None
         dates = template.dates
         assert "{date}" in dates.fmt
         assert dates.style.max_length >= 10
@@ -293,3 +294,125 @@ templates:
     )
     with pytest.raises(ConfigError):
         load_templates(extra_paths=[source], strict=True)
+
+
+def test_custom_defaults_do_not_leak_into_standard_templates(tmp_path: Path):
+    """defaults из своего файла действуют только на его бланки."""
+    background = Path(__file__).resolve().parent.parent / "templates" / "classic.png"
+    source = tmp_path / "custom.yaml"
+    source.write_text(
+        f"""
+defaults:
+  font_size: 12
+  color: "#ff0000"
+
+templates:
+  tiny:
+    title: "Крошечный"
+    background: {background}
+    fields:
+      party1:
+        box: [10, 10, 200, 60]
+""",
+        encoding="utf-8",
+    )
+    templates = load_templates(extra_paths=[source], strict=True)
+    classic = templates.get("classic")
+    tiny = templates.get("tiny")
+    assert classic.fields["party1"].style.font_size == 58
+    assert classic.fields["party1"].style.color == "#1b2a4a"
+    assert tiny.fields["party1"].style.font_size == 12
+    assert tiny.fields["party1"].style.color == "#ff0000"
+
+
+def test_custom_file_sees_main_font_aliases(tmp_path: Path):
+    background = Path(__file__).resolve().parent.parent / "templates" / "classic.png"
+    source = tmp_path / "custom.yaml"
+    source.write_text(
+        f"""
+templates:
+  aliased:
+    title: "Алиас"
+    background: {background}
+    fields:
+      party1:
+        font: serif
+        box: [10, 10, 200, 60]
+""",
+        encoding="utf-8",
+    )
+    template = load_templates(extra_paths=[source], strict=True).get("aliased")
+    assert template.fields["party1"].style.font.name == "PTSerif-Regular.ttf"
+
+
+def test_custom_template_overrides_main_by_key(tmp_path: Path):
+    background = Path(__file__).resolve().parent.parent / "templates" / "classic.png"
+    source = tmp_path / "custom.yaml"
+    source.write_text(
+        f"""
+templates:
+  classic:
+    title: "Классика на минималках"
+    background: {background}
+    fields:
+      party1:
+        box: [10, 10, 200, 60]
+      party2:
+        box: [10, 100, 200, 60]
+""",
+        encoding="utf-8",
+    )
+    templates = load_templates(extra_paths=[source], strict=True)
+    assert templates.get("classic").title == "Классика на минималках"
+    assert templates.get("classic").is_custom
+    assert len(templates) == 5
+
+
+def test_bad_canvas_is_skipped_not_fatal(tmp_path: Path):
+    background = Path(__file__).resolve().parent.parent / "templates" / "classic.png"
+    source = tmp_path / "custom.yaml"
+    source.write_text(
+        f"""
+templates:
+  weird:
+    title: "Кривой холст"
+    background: {background}
+    canvas: [10, 10]
+    fields:
+      party1:
+        box: [10, 10, 20, 20]
+  fine:
+    title: "Нормальный"
+    background: {background}
+    fields:
+      party1:
+        box: [10, 10, 200, 60]
+""",
+        encoding="utf-8",
+    )
+    warnings: list[str] = []
+    templates = load_templates(extra_paths=[source], warnings=warnings)
+    # Плохой холст не роняет файл: бланк остаётся со стандартным холстом,
+    # а в предупреждениях видно, что именно не понравилось.
+    weird = templates.get("weird")
+    assert weird is not None and weird.canvas == (1240, 1754)
+    assert templates.get("fine") is not None
+    assert any("слишком маленький холст" in warning for warning in warnings)
+
+    with pytest.raises(ConfigError):
+        load_templates(extra_paths=[source], strict=True)
+
+
+def test_unknown_timezone_is_rejected(tmp_path: Path, monkeypatch):
+    config_dir = copy_config(tmp_path)
+    monkeypatch.setenv("BOT_TOKEN", "123:TEST")
+    monkeypatch.setenv("OWNER_ID", "42")
+    path = config_dir / "settings.yaml"
+    path.write_text(
+        path.read_text(encoding="utf-8").replace(
+            "timezone: Europe/Moscow", "timezone: Mars/Olympus"
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ConfigError):
+        load_settings(path)

@@ -25,6 +25,7 @@ from aiogram import F, Router
 from aiogram.enums import ChatType
 from aiogram.types import CallbackQuery, Message, User
 
+from . import ui
 from .config import TemplateConfig
 from .render import validate_signature, validate_terms
 from .store import (
@@ -33,6 +34,7 @@ from .store import (
     STATE_TERMS,
     Contract,
     PendingSignature,
+    PendingTerms,
     chat_key,
 )
 
@@ -312,12 +314,28 @@ async def handle_terms_text(
     text: str,
     say: Say,
     contract: Contract,
+    *,
+    ignore_chat: bool = False,
 ) -> None:
-    """Validate the free-form terms and print them on the blank."""
+    """Validate free-form terms and print them on the blank.
+
+    Первый текст — условия с нуля. Каждый следующий — новая редакция:
+    её предложил второй участник (оспаривание) или поправил автор.
+    Подписи под прежней редакцией сбрасываются: подписывать надо то,
+    что напечатано на бланке сейчас.
+    """
     template = app.template_or_first(contract.template_key)
     if template is None or template.terms is None:
         app.store.drop(contract)
         await say(app.config.text("guest.contract_expired", bot=app.bot_username))
+        return
+
+    key = _chat_key(message)
+    if contract.chat_key is not None and contract.chat_key != key and not ignore_chat:
+        app.note(
+            f"terms rejected: chat {key} != contract {contract.chat_key} "
+            f"user={user.id} token={contract.token}"
+        )
         return
 
     check = validate_terms(text, template.terms)
@@ -325,13 +343,74 @@ async def handle_terms_text(
         await say(_terms_error_text(app, check.error, check))
         return
 
-    app.store.set_terms(contract, check.text)
+    revision = bool(contract.terms) and contract.state != STATE_TERMS
+    previous_author = contract.terms_author_id
+    had_signatures = bool(contract.signatures)
+    name = _user_name(user)
+
+    app.store.set_terms(
+        contract,
+        check.text,
+        author_id=user.id,
+        author_name=name,
+    )
+    app.store.clear_pending_terms(token=contract.token)
+    if revision:
+        # Прежние подписи относились к прежним условиям.
+        app.store.reset_signatures(contract)
+    app.note(
+        f"terms token={contract.token} user={user.id} revision={revision} "
+        f"signatures_reset={had_signatures}"
+    )
+
     ok = await app.show_terms_contract(contract, template)
     if not ok:
+        if revision:
+            await say(app.config.text("guest.upload_failed"))
+            return
         # Give the sender another chance: keep waiting for the terms.
         contract.state = STATE_TERMS
         contract.terms_user_id = user.id
         contract.touch()
+        return
+
+    if not revision:
+        return
+
+    disputed = previous_author != user.id
+    headline = app.config.text(
+        "guest.terms_disputed" if disputed else "guest.terms_edited",
+        user=html.escape(name),
+    )
+    tail = app.config.text(
+        "guest.terms_signatures_reset" if had_signatures else "guest.terms_ready"
+    )
+    await say("\n\n".join([headline, ui.terms_quote(check.text), tail]))
+
+
+def _terms_pending_for(
+    app: "App",
+    user: User,
+    message: Message,
+    key: str,
+    target: Contract | None,
+) -> tuple[PendingTerms | None, bool]:
+    """Ожидание новой редакции условий: по бланку, чату или единственное."""
+    if target is not None:
+        pending = app.store.pending_terms_for(user.id, token=target.token)
+        if pending is not None:
+            return pending, False
+    pending = app.store.pending_terms_for(user.id, key)
+    if pending is not None:
+        return pending, False
+    if _is_private(message):
+        # В личке id чата может «переехать» при смене говорящего.
+        candidate = app.store.unique_pending_terms(user.id)
+        if candidate is not None:
+            owner = app.store.get(candidate.token)
+            if owner is not None and (owner.chat_key or "").startswith(PRIVATE_KEY):
+                return candidate, True
+    return None, False
 
 
 # ---------------------------------------------------------------------------
@@ -372,6 +451,7 @@ async def handle_chat_message(app: "App", message: Message) -> None:
         # не должна уехать в соседний бланк или в другой чат.
         target = _reply_contract(app, message, key)
         pending: PendingSignature | None = None
+        terms_pending, terms_loose = _terms_pending_for(app, user, message, key, target)
         terms_contract: Contract | None = None
         if target is not None:
             pending = app.store.pending_for(user.id, token=target.token)
@@ -395,6 +475,41 @@ async def handle_chat_message(app: "App", message: Message) -> None:
                     loose = True
         if pending is None and terms_contract is None:
             terms_contract = app.store.terms_for_user(user.id, key)
+
+        if terms_pending is not None and pending is not None:
+            # Оба ожидания: главнее то, что привязано к сообщению, на
+            # которое ответили. Если ответ не на бланк — главнее условия.
+            target_token = target.token if target is not None else None
+            if pending.token == target_token and terms_pending.token != target_token:
+                terms_pending = None
+            else:
+                pending = None
+
+        if terms_pending is not None:
+            contract_for_terms = app.store.get(terms_pending.token)
+            if contract_for_terms is None:
+                app.store.clear_pending_terms(user.id, terms_pending.token)
+                await say(app.config.text("guest.contract_expired", bot=app.bot_username))
+                return
+            if not accept_input:
+                return
+            if not text:
+                await say(app.config.text("guest.text_only"))
+                return
+            app.note(
+                f"terms input user={user.id} token={terms_pending.token} "
+                f"loose={terms_loose}"
+            )
+            await handle_terms_text(
+                app,
+                message,
+                user,
+                text,
+                say,
+                contract_for_terms,
+                ignore_chat=terms_loose,
+            )
+            return
 
         if pending is not None:
             if not accept_input:
@@ -471,6 +586,20 @@ async def handle_chat_message(app: "App", message: Message) -> None:
             if pending is not None and accept_input:
                 await handle_pending_text(app, message, user, query, say, pending=pending)
                 return
+            terms_pending, terms_loose = _terms_pending_for(app, user, message, key, None)
+            if terms_pending is not None and accept_input:
+                contract_for_terms = app.store.get(terms_pending.token)
+                if contract_for_terms is not None:
+                    await handle_terms_text(
+                        app,
+                        message,
+                        user,
+                        query,
+                        say,
+                        contract_for_terms,
+                        ignore_chat=terms_loose,
+                    )
+                    return
             terms_contract = app.store.terms_for_user(user.id, key)
             if terms_contract is not None and accept_input:
                 await handle_terms_text(app, message, user, query, say, terms_contract)
@@ -504,6 +633,10 @@ async def handle_chat_message(app: "App", message: Message) -> None:
             current = template
             open_contract.template_key = template.key
             open_contract.page = app.index_of(template.key)
+            if template.has_terms:
+                # Свободный бланк вместо превью: сначала условия.
+                open_contract.state = STATE_TERMS
+                open_contract.terms_user_id = user.id
         # Не получилось — контракт остаётся жить на прежней карточке:
         # подписи терять из-за неудачной пересылки нельзя.
         if not await app.repost_contract(message, open_contract, current):
@@ -567,6 +700,10 @@ async def handle_callback(app: "App", query: CallbackQuery) -> None:
 
     if action == "cx":
         await _handle_cancel(app, query, token)
+        return
+
+    if action == "ds":
+        await _handle_dispute(app, query, token)
         return
 
     if action == "no":
@@ -730,6 +867,11 @@ async def _handle_sign_press(
         await query.answer(app.config.text("callback.already_signed", label=field.label))
         return
 
+    editors = app.store.pending_terms_for_contract(contract.token)
+    if any(item.user_id != query.from_user.id for item in editors):
+        await query.answer(app.config.text("callback.terms_changing"))
+        return
+
     holder = app.store.pending_holder(contract.token, field_key)
     if holder is not None and holder != query.from_user.id:
         await query.answer(app.config.text("callback.waiting"))
@@ -742,6 +884,52 @@ async def _handle_sign_press(
     await query.answer("" if ok else app.config.text("errors.generic"))
 
 
+async def _handle_dispute(app: "App", query: CallbackQuery, token: str) -> None:
+    """«Оспорить условия»: попросить свою редакцию свободного договора.
+
+    Нажать может кто угодно. Если нажал автор действующей редакции, это
+    правка своих же условий; для остальных — оспаривание. Итог один:
+    новая редакция заменяет прежнюю, а подписи собираются заново.
+    """
+    contract = _live_contract(app, query, token)
+    if contract is None:
+        await query.answer(_callback_expired(app))
+        return
+
+    template = app.template_or_first(contract.template_key)
+    if template is None or template.terms is None:
+        await query.answer(app.config.text("callback.no_terms"))
+        return
+    if contract.state == STATE_SIGNED:
+        await query.answer(app.config.text("callback.done"))
+        return
+
+    if not contract.terms:
+        # Условий ещё нет: кнопка значит «предложить свои первым».
+        # Кто нажал — тот и пишет редакцию, даже если бота вызвал другой.
+        contract.terms_user_id = query.from_user.id
+        contract.touch()
+        ok = await app.edit_terms_prompt(contract, template)
+        app.note(f"terms claimed token={contract.token} user={query.from_user.id}")
+        await query.answer("" if ok else app.config.text("errors.generic"))
+        return
+
+    editors = app.store.pending_terms_for_contract(contract.token)
+    if any(item.user_id != query.from_user.id for item in editors):
+        await query.answer(app.config.text("callback.terms_changing"))
+        return
+
+    # Условия пересматриваются: начатые подписи под прежней редакцией
+    # продолжать незачем.
+    app.store.clear_pending(token=contract.token)
+    app.store.set_pending_terms(query.from_user.id, contract)
+    ok = await app.show_dispute_prompt(
+        contract, template, _user_name(query.from_user) or None
+    )
+    app.note(f"dispute token={contract.token} user={query.from_user.id}")
+    await query.answer("" if ok else app.config.text("errors.generic"))
+
+
 async def _handle_cancel(app: "App", query: CallbackQuery, token: str) -> None:
     contract = _live_contract(app, query, token)
     if contract is None:
@@ -749,12 +937,16 @@ async def _handle_cancel(app: "App", query: CallbackQuery, token: str) -> None:
         return
 
     holders = {pending.user_id for pending in app.store.pending_for_contract(contract.token)}
+    holders |= {
+        pending.user_id for pending in app.store.pending_terms_for_contract(contract.token)
+    }
     allowed = query.from_user.id in {contract.initiator_id, *holders}
     if not allowed:
         await query.answer(app.config.text("callback.not_yours"))
         return
 
     app.store.clear_pending(token=contract.token)
+    app.store.clear_pending_terms(token=contract.token)
     template = app.template_or_first(contract.template_key)
     if template is not None:
         await app.restore_contract_view(contract, template)
@@ -799,6 +991,7 @@ async def _dm_greeting(app: "App", message: Message, user: User, command: str) -
             bot=app.bot_username,
             max_length=app.settings.limits.signature_max_length,
             ttl_minutes=app.settings.contract.ttl_minutes,
+            terms_max=_max_terms_length(app),
         )
     )
 

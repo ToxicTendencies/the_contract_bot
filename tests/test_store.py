@@ -2,7 +2,13 @@ from __future__ import annotations
 
 import time
 
-from app.store import ContractStore, STATE_PREVIEW, STATE_SIGNED, STATE_TERMS
+from app.store import (
+    ContractStore,
+    STATE_OPEN,
+    STATE_PREVIEW,
+    STATE_SIGNED,
+    STATE_TERMS,
+)
 
 
 def make_store(**overrides) -> ContractStore:
@@ -192,3 +198,68 @@ def test_open_for_chat_skips_signed():
     contract = store.create(chat_key="g1", template_key="classic", initiator_id=10)
     contract.state = STATE_SIGNED
     assert store.open_for_chat("g1") is None
+
+
+def test_set_terms_keeps_previous_revision():
+    store = make_store()
+    contract = store.create(chat_key="g1", template_key="free", initiator_id=10)
+
+    store.set_terms(contract, "первая редакция", author_id=10, author_name="Аня")
+    assert contract.terms == "первая редакция"
+    assert contract.terms_author_id == 10
+    assert contract.state == STATE_OPEN
+
+    store.set_terms(contract, "вторая редакция", author_id=20, author_name="Борис")
+    assert [item.text for item in contract.terms_revisions] == ["первая редакция"]
+    assert contract.terms_revisions[0].user_name == "Аня"
+    assert contract.terms_author_name == "Борис"
+
+
+def test_reset_signatures_clears_pending_input():
+    store = make_store()
+    contract = store.create(chat_key="g1", template_key="free")
+    store.set_terms(contract, "условия", author_id=10)
+    store.add_signature(contract, field_key="party1", text="Аня", user_id=10)
+    store.set_pending(20, contract, "party2")
+
+    store.reset_signatures(contract)
+
+    assert contract.signatures == {}
+    assert store.pending_for(20, "g1") is None
+
+
+def test_pending_terms_lifecycle():
+    store = make_store()
+    contract = store.create(chat_key="g1", template_key="free", initiator_id=10)
+    store.set_terms(contract, "условия", author_id=10)
+
+    pending = store.set_pending_terms(20, contract)
+    assert pending.token == contract.token
+    assert store.pending_terms_for(20, "g1") is pending
+    assert store.pending_terms_for(20, token=contract.token) is pending
+    assert store.pending_terms_for_contract(contract.token) == [pending]
+    assert store.pending_count == 1
+
+    store.clear_pending_terms(token=contract.token)
+    assert store.pending_terms_for(20, "g1") is None
+    assert store.pending_count == 0
+
+
+def test_signature_pending_replaces_terms_pending():
+    store = make_store()
+    contract = store.create(chat_key="g1", template_key="free")
+    store.set_pending_terms(20, contract)
+    store.set_pending(20, contract, "party2")
+
+    assert store.pending_terms_for(20, "g1") is None
+    assert store.pending_for(20, "g1").field_key == "party2"
+
+
+def test_terms_pending_expires_with_the_rest():
+    store = make_store(pending_seconds=0)
+    contract = store.create(chat_key="g1", template_key="free")
+    store.set_pending_terms(20, contract)
+
+    expired = store.expire_pending()
+    assert [item.token for item in expired] == [contract.token]
+    assert store.pending_terms_for(20) is None

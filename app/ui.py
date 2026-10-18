@@ -11,6 +11,13 @@ from .store import Contract, Signature
 
 MAX_BUTTON_TEXT = 40
 
+# Telegram: подпись к сообщению/картинке — не больше 1024 символов.
+CAPTION_LIMIT = 1000
+
+# Меньше этого цитату в подпись не вставляем: обрезанная до пары слов
+# цитата только путает.
+TERMS_MIN_QUOTE = 80
+
 
 def _q(cfg: ConfigManager, key: str, **kwargs) -> str:
     return cfg.text(key, **kwargs)
@@ -25,44 +32,111 @@ def _sign_button_text(cfg: ConfigManager, label: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# free-form terms: always shown as a quote inside the message
+# ---------------------------------------------------------------------------
+
+def terms_quote(text: str, *, budget: int | None = None) -> str:
+    """Текст условий цитатой: Telegram рисует ``<blockquote>`` в HTML."""
+    if not text:
+        return ""
+    escaped = html.escape(text)
+    if budget is not None and budget > 0 and len(escaped) > budget:
+        cut = escaped[: max(0, budget - 1)]
+        # не рвать HTML-сущность (&amp; и т.п.) посередине
+        amp = cut.rfind("&")
+        if amp != -1 and cut.find(";", amp) == -1:
+            cut = cut[:amp]
+        escaped = cut.rstrip() + "…"
+    return f"<blockquote>{escaped}</blockquote>"
+
+
+def with_terms(
+    cfg: ConfigManager,
+    caption: str,
+    terms: str,
+    *,
+    author: str = "",
+    limit: int = CAPTION_LIMIT,
+) -> str:
+    """Дописать к подписи условия цитатой (и автора редакции)."""
+    if not terms:
+        return caption
+    budget = limit - len(caption) - 2
+    if author:
+        budget -= 80
+    if budget < TERMS_MIN_QUOTE:
+        return caption
+    caption = caption.rstrip() + "\n\n" + terms_quote(terms, budget=budget)
+    if author:
+        caption += "\n" + _q(cfg, "guest.terms_author", name=html.escape(author))
+    return caption
+
+
+# ---------------------------------------------------------------------------
 # keyboards (everything happens in the chat)
 # ---------------------------------------------------------------------------
+
+
+def _column(buttons: list[InlineKeyboardButton]) -> list[list[InlineKeyboardButton]]:
+    """Каждая кнопка — на своей строке.
+
+    Telegram растягивает строку на всю ширину клавиатуры и делит её между
+    кнопками: две кнопки в строке — половинки, одна — вся ширина. Как только
+    число кнопок в строке меняется (превью → бланк → подписано), кнопки
+    «скачут» по ширине. Поэтому в сценарии контракта все строки — из одной
+    кнопки: ширина не меняется никогда.
+    """
+    return [[button] for button in buttons]
 
 
 def preview_markup(cfg: ConfigManager, token: str, index: int, total: int) -> InlineKeyboardMarkup:
     prev_index = (index - 1) % total
     next_index = (index + 1) % total
-    row = [
+    buttons = [
         InlineKeyboardButton(text=_q(cfg, "buttons.prev"), callback_data=f"pv:{token}:{prev_index}"),
         InlineKeyboardButton(text=_q(cfg, "buttons.pick"), callback_data=f"pk:{token}:{index}"),
         InlineKeyboardButton(text=_q(cfg, "buttons.next"), callback_data=f"pn:{token}:{next_index}"),
     ]
-    return InlineKeyboardMarkup(inline_keyboard=[row])
+    return InlineKeyboardMarkup(inline_keyboard=_column(buttons))
 
 
 def contract_markup(cfg: ConfigManager, token: str, template: TemplateConfig) -> InlineKeyboardMarkup:
-    rows: list[list[InlineKeyboardButton]] = []
-    row: list[InlineKeyboardButton] = []
-    for field in template.fields.values():
-        row.append(
-            InlineKeyboardButton(
-                text=_sign_button_text(cfg, field.label),
-                callback_data=f"sg:{token}:{template.key}:{field.key}",
-            )
+    buttons = [
+        InlineKeyboardButton(
+            text=_sign_button_text(cfg, field.label),
+            callback_data=f"sg:{token}:{template.key}:{field.key}",
         )
-        if len(row) == 2:
-            rows.append(row)
-            row = []
-    if row:
-        rows.append(row)
-    rows.append([InlineKeyboardButton(text=_q(cfg, "buttons.cancel"), callback_data=f"cx:{token}")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+        for field in template.fields.values()
+    ]
+    buttons.append(
+        InlineKeyboardButton(text=_q(cfg, "buttons.cancel"), callback_data=f"cx:{token}")
+    )
+    return InlineKeyboardMarkup(inline_keyboard=_column(buttons))
+
+
+def terms_prompt_markup(cfg: ConfigManager, token: str) -> InlineKeyboardMarkup:
+    """Пока условий нет, их может предложить любой — кнопка видна сразу."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=_column(
+            [
+                InlineKeyboardButton(
+                    text=_trim(_q(cfg, "buttons.propose_terms"), 60),
+                    callback_data=f"ds:{token}",
+                )
+            ]
+        )
+    )
 
 
 def signed_buttons_markup(
-    cfg: ConfigManager, token: str, template: TemplateConfig, signed: set[str]
+    cfg: ConfigManager,
+    token: str,
+    template: TemplateConfig,
+    signed: set[str],
+    *,
+    dispute: bool = False,
 ) -> InlineKeyboardMarkup:
-    rows: list[list[InlineKeyboardButton]] = []
+    buttons: list[InlineKeyboardButton] = []
     for field in template.fields.values():
         if field.key in signed:
             label = _trim(_q(cfg, "buttons.signed", label=field.label))
@@ -70,9 +144,26 @@ def signed_buttons_markup(
         else:
             label = _sign_button_text(cfg, field.label)
             callback_data = f"sg:{token}:{template.key}:{field.key}"
-        rows.append([InlineKeyboardButton(text=label, callback_data=callback_data)])
-    rows.append([InlineKeyboardButton(text=_q(cfg, "buttons.cancel"), callback_data=f"cx:{token}")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+        buttons.append(InlineKeyboardButton(text=label, callback_data=callback_data))
+    if dispute:
+        buttons.append(
+            InlineKeyboardButton(
+                text=_trim(_q(cfg, "buttons.dispute"), 60),
+                callback_data=f"ds:{token}",
+            )
+        )
+    buttons.append(
+        InlineKeyboardButton(text=_q(cfg, "buttons.cancel"), callback_data=f"cx:{token}")
+    )
+    return InlineKeyboardMarkup(inline_keyboard=_column(buttons))
+
+
+def dispute_markup(cfg: ConfigManager, token: str) -> InlineKeyboardMarkup:
+    """Пока человек печатает новую редакцию, подписывать нечего."""
+    buttons = [
+        InlineKeyboardButton(text=_q(cfg, "buttons.cancel"), callback_data=f"cx:{token}")
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=_column(buttons))
 
 
 def empty_markup() -> InlineKeyboardMarkup:
@@ -96,13 +187,21 @@ def preview_caption(cfg: ConfigManager, template: TemplateConfig, index: int, to
     return _q(cfg, "guest.preview_caption_no_description", **data)
 
 
-def contract_caption(cfg: ConfigManager, template: TemplateConfig, max_length: int) -> str:
-    return _q(
+def contract_caption(
+    cfg: ConfigManager,
+    template: TemplateConfig,
+    max_length: int,
+    *,
+    terms: str = "",
+    author: str = "",
+) -> str:
+    caption = _q(
         cfg,
         "guest.contract_caption",
         title=html.escape(template.title),
         max_length=max_length,
     )
+    return with_terms(cfg, caption, terms, author=author)
 
 
 def terms_prompt(cfg: ConfigManager, template: TemplateConfig, max_length: int) -> str:
@@ -115,22 +214,50 @@ def terms_prompt(cfg: ConfigManager, template: TemplateConfig, max_length: int) 
 
 
 def sign_prompt_caption(
-    cfg: ConfigManager, field: FieldConfig, user_name: str | None, max_length: int
+    cfg: ConfigManager,
+    field: FieldConfig,
+    user_name: str | None,
+    max_length: int,
+    *,
+    terms: str = "",
+    author: str = "",
 ) -> str:
     if user_name:
-        return _q(
+        caption = _q(
             cfg,
             "guest.sign_prompt",
             label=html.escape(field.label),
             user=html.escape(user_name),
             max_length=max_length,
         )
-    return _q(
+    else:
+        caption = _q(
+            cfg,
+            "guest.sign_prompt_anonymous",
+            label=html.escape(field.label),
+            max_length=max_length,
+        )
+    return with_terms(cfg, caption, terms, author=author)
+
+
+def dispute_prompt(
+    cfg: ConfigManager,
+    template: TemplateConfig,
+    user_name: str | None,
+    max_length: int,
+    *,
+    terms: str = "",
+    contract_author: str = "",
+) -> str:
+    """Просьба прислать свою редакцию условий."""
+    caption = _q(
         cfg,
-        "guest.sign_prompt_anonymous",
-        label=html.escape(field.label),
+        "guest.dispute_prompt",
+        title=html.escape(template.title),
+        user=html.escape(user_name or ""),
         max_length=max_length,
     )
+    return with_terms(cfg, caption, terms, author=contract_author)
 
 
 def done_caption(
@@ -138,11 +265,16 @@ def done_caption(
     template: TemplateConfig,
     self_signed: bool,
     note: str,
+    *,
+    terms: str = "",
+    author: str = "",
 ) -> str:
     title = html.escape(template.title)
     if self_signed:
-        return _q(cfg, "guest.done_self_caption", title=title, note=html.escape(note))
-    return _q(cfg, "guest.done_caption", title=title)
+        caption = _q(cfg, "guest.done_self_caption", title=title, note=html.escape(note))
+    else:
+        caption = _q(cfg, "guest.done_caption", title=title)
+    return with_terms(cfg, caption, terms, author=author)
 
 
 # ---------------------------------------------------------------------------
@@ -188,9 +320,15 @@ def owner_caption(
         source=html.escape(source),
     )
     if contract.terms:
-        caption += "\n\n" + _q(
+        caption = caption.rstrip() + "\n\n" + _q(
             cfg,
             "archive.terms_line",
             terms=html.escape(contract.terms[:400]),
         )
+        if contract.terms_author_name:
+            caption += "\n" + _q(
+                cfg,
+                "archive.terms_author_line",
+                name=html.escape(contract.terms_author_name),
+            )
     return caption

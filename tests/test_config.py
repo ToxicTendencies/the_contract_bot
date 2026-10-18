@@ -153,3 +153,19 @@ def test_template_key_rejects_non_ascii(tmp_path):
     path.write_text(text, encoding="utf-8")
     with pytest.raises(ConfigError, match="длиннее 16"):
         load_templates(path, Limits(), strict=True)
+
+
+def test_text_values_can_contain_braces(tmp_path, monkeypatch):
+    """Текст условий пишут пользователи: фигурные скобки не должны ломать подстановку."""
+    config_dir = copy_config(tmp_path)
+    monkeypatch.setenv("BOT_TOKEN", "123:TEST")
+    monkeypatch.setenv("OWNER_ID", "42")
+    manager = ConfigManager(config_dir)
+
+    line = manager.text(
+        "archive.terms_line", terms="платит {1000} ₽, шаблон {terms} и {заказчик}"
+    )
+    assert "платит {1000} ₽, шаблон {terms} и {заказчик}" in line
+
+    # не переданный плейсхолдер остаётся видимым, как и раньше
+    assert manager.text("archive.terms_line").endswith("{terms}")

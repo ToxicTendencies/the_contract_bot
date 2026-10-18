@@ -12,7 +12,7 @@ import types
 import pytest
 
 from app.handlers import handle_callback, handle_chat_message
-from app.store import STATE_OPEN, STATE_SIGNED, STATE_TERMS
+from app.store import STATE_OPEN, STATE_PREVIEW, STATE_SIGNED, STATE_TERMS
 
 from .helpers import FakeCallback, FakeChat, FakeUser
 
@@ -944,3 +944,377 @@ async def test_new_contract_word_starts_over(wired):
     third = app.store.open_for_chat("g-100500")
     assert third is not None and third.token not in {first.token, second.token}
     assert not third.signatures
+
+
+# ---------------------------------------------------------------------------
+# свободный договор: условия цитатой + оспаривание
+# ---------------------------------------------------------------------------
+
+
+async def _free_contract(app, author, chat, terms: str):
+    """Завести свободный договор с готовыми условиями."""
+    await handle_chat_message(app, FakeGuestMessage("@test_bot условия", author, chat))
+    contract = app.store.for_chat(_key(chat))
+    await handle_chat_message(app, reply_to_bot(terms, author, contract, chat=chat))
+    return contract
+
+
+def _key(chat: FakeChat) -> str:
+    return f"g{chat.id}"
+
+
+@pytest.mark.asyncio
+async def test_free_terms_shown_as_quote_with_dispute_button(wired):
+    """Условия видны в сообщении цитатой, рядом — кнопка «оспорить»."""
+    app, bot, _ = wired
+    anna = FakeUser(10, first_name="Аня")
+    chat = FakeChat(-100500)
+    terms = "Исполнитель делает макет, Заказчик платит 1000 ₽ до пятницы."
+
+    contract = await _free_contract(app, anna, chat, terms)
+
+    caption = bot.edits[-1]["media"].caption
+    assert f"<blockquote>{terms}</blockquote>" in caption
+    assert "Редакция: Аня" in caption
+    keys = [button.callback_data for row in bot.edits[-1]["reply_markup"].inline_keyboard for button in row]
+    assert f"ds:{contract.token}" in keys
+
+    # у обычного бланка оспаривать нечего
+    await handle_chat_message(app, FakeGuestMessage("@test_bot новый", anna, chat, query_id="q2"))
+    classic = app.store.for_chat("g-100500")
+    await press(app, f"pk:{classic.token}:0", anna, classic.inline_message_id)
+    keys = [button.callback_data for row in bot.edits[-1]["reply_markup"].inline_keyboard for button in row]
+    assert all(not key.startswith("ds:") for key in keys)
+
+
+@pytest.mark.asyncio
+async def test_dispute_terms_and_resets_signatures(wired):
+    """Второй участник оспаривает условия: подписи сбрасываются, бланк новый."""
+    app, bot, storage = wired
+    anna = FakeUser(10, first_name="Аня")
+    boris = FakeUser(20, first_name="Борис")
+    chat = FakeChat(-100500)
+    first_terms = "Заказчик платит 1000 ₽."
+
+    contract = await _free_contract(app, anna, chat, first_terms)
+    await press(app, f"sg:{contract.token}:free:party1", anna, contract.inline_message_id)
+    await handle_chat_message(app, reply_to_bot("Анна А.", anna, contract, chat=chat))
+    assert set(contract.signatures) == {"party1"}
+
+    # Борис жмёт «оспорить»
+    dispute = await press(app, f"ds:{contract.token}", boris, contract.inline_message_id)
+    assert dispute.answers[-1] == ""
+    assert app.store.pending_terms_for(boris.id).token == contract.token
+    prompt = bot.edits[-1]["media"].caption
+    assert "Новая редакция условий" in prompt
+    assert f"<blockquote>{first_terms}</blockquote>" in prompt
+    assert [b.callback_data for row in bot.edits[-1]["reply_markup"].inline_keyboard for b in row] == [
+        f"cx:{contract.token}"
+    ]
+
+    # Борис присылает свою редакцию
+    second_terms = "Заказчик платит 500 ₽."
+    reply = reply_to_bot(second_terms, boris, contract, chat=chat, query_id="r2")
+    await handle_chat_message(app, reply)
+
+    assert contract.terms == second_terms
+    assert contract.terms_author_id == boris.id
+    assert contract.signatures == {}, "подписи под старыми условиями недействительны"
+    assert app.store.pending_terms_for(boris.id) is None
+    assert [item.text for item in contract.terms_revisions] == [first_terms]
+    assert len(storage.uploads) == 2, "бланк перерисован с новой редакцией"
+
+    message = reply.answers[-1].input_message_content.message_text
+    assert "Борис" in message and "оспор" in message.lower()
+    assert f"<blockquote>{second_terms}</blockquote>" in message
+    assert "Старые подписи сброшены" in message
+
+    card = bot.edits[-1]["media"].caption
+    assert f"<blockquote>{second_terms}</blockquote>" in card
+    assert "Редакция: Борис" in card
+
+    # подписывают заново — и финал
+    await press(app, f"sg:{contract.token}:free:party1", anna, contract.inline_message_id)
+    await handle_chat_message(app, reply_to_bot("Анна А.", anna, contract, chat=chat))
+    await press(app, f"sg:{contract.token}:free:party2", boris, contract.inline_message_id)
+    await handle_chat_message(app, reply_to_bot("Борис Б.", boris, contract, chat=chat))
+    assert contract.state == STATE_SIGNED
+    final_caption = bot.edits[-1]["media"].caption
+    assert f"<blockquote>{second_terms}</blockquote>" in final_caption
+
+    archive = storage.archive[-1]["caption"]
+    assert "Редакция: Борис" in archive
+    assert second_terms in archive
+
+
+@pytest.mark.asyncio
+async def test_author_can_change_own_terms(wired):
+    """Автор тоже может нажать «оспорить» — и условия поменяются."""
+    app, _, _ = wired
+    anna = FakeUser(10, first_name="Аня")
+    chat = FakeChat(-100500)
+    contract = await _free_contract(app, anna, chat, "Первая редакция.")
+
+    press_ds = await press(app, f"ds:{contract.token}", anna, contract.inline_message_id)
+    assert press_ds.answers[-1] == ""
+    reply = reply_to_bot("Вторая редакция.", anna, contract, chat=chat, query_id="r2")
+    await handle_chat_message(app, reply)
+
+    assert contract.terms == "Вторая редакция."
+    message = reply.answers[-1].input_message_content.message_text
+    assert "обновил" in message
+    assert "Вторая редакция." in message
+    assert "Сброшены" not in message, "подписей не было — сбрасывать нечего"
+    assert "Теперь можно подписывать" in message
+
+
+@pytest.mark.asyncio
+async def test_dispute_can_be_cancelled(wired):
+    """Отмена возвращает карточку с условиями и кнопками."""
+    app, bot, _ = wired
+    anna = FakeUser(10, first_name="Аня")
+    boris = FakeUser(20, first_name="Борис")
+    chat = FakeChat(-100500)
+    terms = "Заказчик платит 1000 ₽."
+    contract = await _free_contract(app, anna, chat, terms)
+    await press(app, f"sg:{contract.token}:free:party1", anna, contract.inline_message_id)
+    await handle_chat_message(app, reply_to_bot("Анна А.", anna, contract, chat=chat))
+
+    await press(app, f"ds:{contract.token}", boris, contract.inline_message_id)
+    cancel = await press(app, f"cx:{contract.token}", boris, contract.inline_message_id)
+
+    assert cancel.answers[-1] == app.config.text("callback.cancelled")
+    assert app.store.pending_terms_for(boris.id) is None
+    assert set(contract.signatures) == {"party1"}
+    restored = bot.edits[-1]["media"].caption
+    assert f"<blockquote>{terms}</blockquote>" in restored
+    keys = [b.callback_data for row in bot.edits[-1]["reply_markup"].inline_keyboard for b in row]
+    assert f"ds:{contract.token}" in keys
+
+
+@pytest.mark.asyncio
+async def test_only_one_dispute_at_a_time(wired):
+    """Пока один пишет новую редакцию, второй не перебивает."""
+    app, _, _ = wired
+    anna = FakeUser(10, first_name="Аня")
+    boris = FakeUser(20, first_name="Борис")
+    chat = FakeChat(-100500)
+    contract = await _free_contract(app, anna, chat, "Условия.")
+
+    await press(app, f"ds:{contract.token}", anna, contract.inline_message_id)
+    second = await press(app, f"ds:{contract.token}", boris, contract.inline_message_id)
+    assert second.answers[-1] == app.config.text("callback.terms_changing")
+    assert app.store.pending_terms_for(boris.id) is None
+
+    sign = await press(app, f"sg:{contract.token}:free:party2", boris, contract.inline_message_id)
+    assert sign.answers[-1] == app.config.text("callback.terms_changing")
+    assert app.store.pending_for(boris.id) is None
+
+
+@pytest.mark.asyncio
+async def test_dispute_needs_free_terms(wired):
+    """На обычном бланке кнопка оспаривания отвечает понятной ошибкой."""
+    app, _, _ = wired
+    anna = FakeUser(10, first_name="Аня")
+    boris = FakeUser(20, first_name="Борис")
+    chat = FakeChat(-100500)
+
+    await handle_chat_message(app, FakeGuestMessage("@test_bot", anna, chat))
+    contract = app.store.for_chat("g-100500")
+    await press(app, f"pk:{contract.token}:0", anna, contract.inline_message_id)
+
+    answer = await press(app, f"ds:{contract.token}", boris, contract.inline_message_id)
+    assert answer.answers[-1] == app.config.text("callback.no_terms")
+    assert app.store.pending_terms_for(boris.id) is None
+
+    # у свободного бланка без условий кнопка значит «предложить свои первым»
+    await handle_chat_message(app, FakeGuestMessage("@test_bot новый", anna, chat, query_id="q2"))
+    await handle_chat_message(app, FakeGuestMessage("@test_bot условия", anna, chat, query_id="q3"))
+    fresh = app.store.for_chat("g-100500")
+    assert fresh.state == STATE_TERMS
+    assert fresh.terms_user_id == anna.id
+
+    early = await press(app, f"ds:{fresh.token}", boris, fresh.inline_message_id)
+    assert early.answers[-1] == ""
+    assert fresh.terms_user_id == boris.id, "кто нажал — тот и пишет условия"
+
+
+@pytest.mark.asyncio
+async def test_member_mode_dispute_terms(wired):
+    """Бот в чате: оспорить можно кнопкой на обычном сообщении."""
+    app, bot, storage = wired
+    chat = FakeChat(-100777)
+    anna = FakeUser(10, first_name="Аня")
+    boris = FakeUser(20, first_name="Борис")
+    bot_user = FakeUser(999, first_name="Bot", is_bot=True, username="test_bot")
+
+    await handle_chat_message(app, FakeChatMessage("@test_bot условия", anna, chat))
+    contract = app.store.for_chat("g-100777")
+    card_id = contract.message_id
+
+    first = FakeChatMessage(
+        "Старые условия.",
+        anna,
+        chat,
+        reply_to=types.SimpleNamespace(from_user=bot_user, message_id=card_id),
+    )
+    await handle_chat_message(app, first)
+    assert contract.terms == "Старые условия."
+    assert contract.terms_author_id == anna.id
+
+    query = FakeCallback(f"ds:{contract.token}", boris)
+    query.inline_message_id = None
+    query.message = types.SimpleNamespace(
+        chat=types.SimpleNamespace(id=-100777), message_id=card_id
+    )
+    await handle_callback(app, query)
+    assert query.answers[-1] == ""
+    assert app.store.pending_terms_for(boris.id).token == contract.token
+
+    second = FakeChatMessage(
+        "Новые условия.",
+        boris,
+        chat,
+        reply_to=types.SimpleNamespace(from_user=bot_user, message_id=card_id),
+        message_id_base=901,
+    )
+    await handle_chat_message(app, second)
+
+    assert contract.terms == "Новые условия."
+    assert contract.terms_author_id == boris.id
+    assert len(storage.uploads) == 2
+    assert contract.message_id == card_id, "карточка та же, её и редактируем"
+    assert "Новые условия." in second.replies[-1]
+    assert "<blockquote>Новые условия.</blockquote>" in bot.edits[-1]["media"].caption
+
+
+@pytest.mark.asyncio
+async def test_private_chat_dispute(wired):
+    """Личка двух людей: второй оспаривает условия и подписываем заново."""
+    app, _, _ = wired
+    anna = FakeUser(10, first_name="Аня")
+    boris = FakeUser(20, first_name="Борис")
+    anna_chat = FakeChat(boris.id, type="private")
+    boris_chat = FakeChat(anna.id, type="private")
+
+    await handle_chat_message(app, FakeGuestMessage("@test_bot условия", anna, anna_chat))
+    contract = app.store.for_chat("p10:20")
+    await handle_chat_message(
+        app, reply_to_bot("Старые условия.", anna, contract, chat=anna_chat)
+    )
+    await press(app, f"sg:{contract.token}:free:party1", anna, contract.inline_message_id)
+    await handle_chat_message(
+        app, reply_to_bot("Анна А.", anna, contract, chat=anna_chat, query_id="r1")
+    )
+
+    await press(app, f"ds:{contract.token}", boris, contract.inline_message_id)
+    await handle_chat_message(
+        app, reply_to_bot("Новые условия.", boris, contract, chat=boris_chat, query_id="r2")
+    )
+
+    assert contract.terms == "Новые условия."
+    assert contract.terms_author_id == boris.id
+    assert contract.signatures == {}
+
+
+@pytest.mark.asyncio
+async def test_free_template_replaces_untouched_preview(wired):
+    """@бот → @бот условия: нетронутое превью превращается в свободный бланк."""
+    app, _, _ = wired
+    anna = FakeUser(10, first_name="Аня")
+    chat = FakeChat(-100500)
+
+    await handle_chat_message(app, FakeGuestMessage("@test_bot", anna, chat))
+    contract = app.store.for_chat("g-100500")
+    assert contract.state == STATE_PREVIEW
+
+    second = FakeGuestMessage("@test_bot условия", anna, chat, query_id="q2")
+    await handle_chat_message(app, second)
+
+    assert app.store.for_chat("g-100500") is contract
+    assert contract.template_key == "free"
+    assert contract.state == STATE_TERMS
+    assert contract.terms_user_id == anna.id
+    assert "Ответь на это сообщение условиями" in second.answers[-1].caption
+
+
+# ---------------------------------------------------------------------------
+# клавиатуры: ровно одна кнопка в строке — ширина не скачет
+# ---------------------------------------------------------------------------
+
+
+def _rows(markup) -> list[list]:
+    return markup.inline_keyboard
+
+
+@pytest.mark.asyncio
+async def test_buttons_are_full_width_in_every_state(wired):
+    """В сценарии контракта в каждой строке одна кнопка: ширина неизменна."""
+    app, bot, _ = wired
+    anna = FakeUser(10, first_name="Аня")
+    chat = FakeChat(-100500)
+
+    # превью-карусель
+    summon = FakeGuestMessage("@test_bot", anna, chat)
+    await handle_chat_message(app, summon)
+    contract = app.store.for_chat("g-100500")
+    assert all(len(row) == 1 for row in _rows(summon.answers[-1].reply_markup))
+
+    # свободный бланк: сперва просьба условий
+    pick = await press(app, f"pk:{contract.token}:4", anna, contract.inline_message_id)
+    assert pick.answers[-1] == ""
+    assert all(len(row) == 1 for row in _rows(bot.edits[-1]["reply_markup"]))
+
+    # условия на бланке
+    await handle_chat_message(app, reply_to_bot("Условия.", anna, contract, chat=chat))
+    assert all(len(row) == 1 for row in _rows(bot.edits[-1]["reply_markup"]))
+
+    # просьба подписи и прогресс
+    await press(app, f"sg:{contract.token}:free:party1", anna, contract.inline_message_id)
+    assert all(len(row) == 1 for row in _rows(bot.edits[-1]["reply_markup"]))
+    await handle_chat_message(app, reply_to_bot("Анна А.", anna, contract, chat=chat))
+    assert all(len(row) == 1 for row in _rows(bot.edits[-1]["reply_markup"]))
+
+    # обычный бланк тоже
+    await handle_chat_message(app, FakeGuestMessage("@test_bot новый", anna, chat, query_id="q2"))
+    second = app.store.for_chat("g-100500")
+    await press(app, f"pk:{second.token}:0", anna, second.inline_message_id)
+    assert all(len(row) == 1 for row in _rows(bot.edits[-1]["reply_markup"]))
+
+
+@pytest.mark.asyncio
+async def test_terms_prompt_lets_anyone_propose_terms(wired):
+    """Кнопка «предложить условия» видна сразу и доступна любому участнику."""
+    app, bot, storage = wired
+    anna = FakeUser(10, first_name="Аня")
+    boris = FakeUser(20, first_name="Борис")
+    chat = FakeChat(-100500)
+
+    summon = FakeGuestMessage("@test_bot условия", anna, chat)
+    await handle_chat_message(app, summon)
+    contract = app.store.for_chat("g-100500")
+    prompt = summon.answers[-1]
+    keys = [button.callback_data for row in _rows(prompt.reply_markup) for button in row]
+    assert keys == [f"ds:{contract.token}"]
+    assert prompt.reply_markup.inline_keyboard[0][0].text == app.config.text(
+        "buttons.propose_terms"
+    )
+
+    # Борис перехватывает авторство условий
+    claim = await press(app, f"ds:{contract.token}", boris, contract.inline_message_id)
+    assert claim.answers[-1] == ""
+    assert contract.terms_user_id == boris.id
+    assert contract.state == STATE_TERMS
+
+    reply = reply_to_bot("Борисовы условия.", boris, contract, chat=chat, query_id="r2")
+    await handle_chat_message(app, reply)
+
+    assert contract.terms == "Борисовы условия."
+    assert contract.terms_author_id == boris.id
+    assert storage.uploads
+    # теперь на карточке — «оспорить»
+    keys = [b.callback_data for row in _rows(bot.edits[-1]["reply_markup"]) for b in row]
+    assert f"ds:{contract.token}" in keys
+    assert bot.edits[-1]["reply_markup"].inline_keyboard[2][0].text == app.config.text(
+        "buttons.dispute"
+    )

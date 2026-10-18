@@ -13,7 +13,7 @@ import pytest
 
 from app.handlers import handle_callback, handle_chat_message
 from app.render import default_date, render_contract
-from app.store import STATE_OPEN, STATE_PREVIEW, STATE_SIGNED, STATE_TERMS
+from app.store import STATE_OPEN, STATE_PREVIEW, STATE_SEAL, STATE_SIGNED, STATE_TERMS
 
 from .helpers import FakeCallback, FakeChat, FakeUser
 
@@ -142,6 +142,18 @@ async def press(app, data: str, user: FakeUser, inline_id: str | None = None):
     return query
 
 
+async def seal_contract(app, contract, creator, *, date: str | None = None):
+    """Создатель подтверждает дату и ставит печать — только потом контракт готов."""
+    if date is not None:
+        await press(app, f"dt:{contract.token}", creator, contract.inline_message_id)
+        await handle_chat_message(
+            app,
+            reply_to_bot(date, creator, contract, query_id="seal-date"),
+        )
+    await press(app, f"slc:{contract.token}", creator, contract.inline_message_id)
+    return await press(app, f"sl:{contract.token}", creator, contract.inline_message_id)
+
+
 def reply_to_bot(
     text: str,
     user: FakeUser,
@@ -210,23 +222,61 @@ async def test_full_chat_flow(wired):
     assert press2.answers[-1] == ""
     await handle_chat_message(app, reply_to_bot("Борис Б.", boris, contract))
 
-    # 6. Финал: картинка с подписями, кнопок нет
+    # 6. Все подписали, но контракт ещё не готов: создатель подтверждает дату
+    assert contract.state == STATE_SEAL
+    seal_card = bot.edits[-1]
+    assert seal_card["media"].media == "file-classic"
+    seal_keys = [
+        button.callback_data
+        for row in seal_card["reply_markup"].inline_keyboard
+        for button in row
+    ]
+    assert seal_keys == [f"slc:{contract.token}", f"dt:{contract.token}"]
+
+    # 7. Только создатель может подтвердить дату и поставить печать
+    stranger = await press(app, f"slc:{contract.token}", FakeUser(30), contract.inline_message_id)
+    assert stranger.answers[-1] == app.config.text("callback.not_creator")
+    assert contract.state == STATE_SEAL
+
+    confirm = await press(app, f"slc:{contract.token}", anna, contract.inline_message_id)
+    assert confirm.answers[-1] == ""
+    assert contract.date_confirmed is True
+    stamp_keys = [
+        button.callback_data
+        for row in bot.edits[-1]["reply_markup"].inline_keyboard
+        for button in row
+    ]
+    assert stamp_keys == [f"sl:{contract.token}"]
+
+    stamped = await press(app, f"sl:{contract.token}", anna, contract.inline_message_id)
+    assert stamped.answers[-1] == app.config.text("guest.stamp_complete")
+
+    # 8. Финал: картинка с подписями и печатью, кнопок нет
     assert contract.state == STATE_SIGNED
+    assert contract.is_stamped
     final = bot.edits[-1]
     assert final["inline_message_id"] == contract.inline_message_id
     assert final["media"].media == "signed-file-id"
     assert final["reply_markup"].inline_keyboard == []
     assert "Подписано" in final["media"].caption
 
-    # 7. Архив владельцу: файл + ссылки на подписантов
+    # 9. Архив владельцу: файл + ссылки на подписантов
     assert storage.archive
     caption = storage.archive[-1]["caption"]
     assert "https://t.me/anna" in caption
     assert "tg://user?id=20" in caption
     assert "Сторона 1" in caption and "Сторона 2" in caption
     assert storage.archive[-1]["data"][:2] == b"\xff\xd8"
+    expected = render_contract(
+        app.config.templates.get("classic"),
+        {"party1": "Анна А.", "party2": "Борис Б."},
+        date=contract.date_text,
+        settings=app.settings.render,
+        stamped=True,
+    )
+    assert storage.archive[-1]["data"] == expected
 
-    # 8. Позднее нажатие на старую кнопку не запускает новую подпись
+    # 10. Позднее нажатие на старую кнопку не запускает новую подпись
     late = await press(
         app, f"sg:{contract.token}:classic:party1", FakeUser(30), contract.inline_message_id
     )
@@ -251,7 +301,8 @@ async def test_any_chat_member_can_press_both_sides(wired):
     assert app.store.pending_for(20) is not None
     await handle_chat_message(app, reply_to_bot("Борис Б.", boris, contract))
 
-    assert contract.state == STATE_SIGNED
+    # Оба подписали, но контракт ждёт создателя: дату и печать.
+    assert contract.state == STATE_SEAL
     assert contract.signatures["party1"].user_id == 10
     assert contract.signatures["party2"].user_id == 20
 
@@ -321,7 +372,7 @@ async def test_new_mention_continues_contract(wired):
     await handle_chat_message(
         app, reply_to_bot("Поздний Б.", FakeUser(66), contract, chat=chat)
     )
-    assert contract.state == STATE_SIGNED
+    assert contract.state == STATE_SEAL, "подписи собраны, но печати ещё нет"
     assert contract.signatures["party2"].user_id == 66
 
 
@@ -364,6 +415,9 @@ async def test_free_terms_flow(wired):
     await press(app, f"sg:{contract.token}:free:party2", boris, contract.inline_message_id)
     await handle_chat_message(app, reply_to_bot("Борис Б.", boris, contract))
 
+    # 5. Печать: только после неё контракт готов
+    assert contract.state == STATE_SEAL
+    await seal_contract(app, contract, anna)
     assert contract.state == STATE_SIGNED
     final = bot.edits[-1]
     assert final["media"].media == "signed-file-id"
@@ -490,6 +544,15 @@ async def test_member_mode_keeps_everything_in_chat(wired):
     await handle_chat_message(
         app, FakeChatMessage("Борис Б.", boris, chat, reply_to=types.SimpleNamespace(from_user=bot_user))
     )
+
+    assert contract.state == STATE_SEAL
+    assert app.seal_needs_date(contract, app.config.templates.get("classic"))
+
+    # Дату и печать ставит создатель — Анна.  Сообщение то же самое.
+    confirm = await press(app, f"slc:{contract.token}", anna)
+    assert confirm.answers[-1] == ""
+    stamp = await press(app, f"sl:{contract.token}", anna)
+    assert stamp.answers[-1] == app.config.text("guest.stamp_complete")
 
     assert contract.state == STATE_SIGNED
     final = bot.edits[-1]
@@ -762,11 +825,15 @@ async def test_member_mode_free_contract_both_sides(wired):
         ),
     )
 
-    assert contract.state == STATE_SIGNED
+    assert contract.state == STATE_SEAL
     assert {key: sig.text for key, sig in contract.signatures.items()} == {
         "party1": "Анна А.",
         "party2": "Борис Б.",
     }
+    confirm = await press(app, f"slc:{contract.token}", anna)
+    assert confirm.answers[-1] == ""
+    await press(app, f"sl:{contract.token}", anna)
+    assert contract.state == STATE_SIGNED
     assert bot.edits[-1]["media"].media == "signed-file-id"
     assert bot.edits[-1]["reply_markup"].inline_keyboard == []
     assert "Условия:" in storage.archive[-1]["caption"]
@@ -795,8 +862,12 @@ async def test_two_signers_through_repost_finalize(wired):
     await press(app, f"sg:{contract.token}:classic:party2", boris, contract.inline_message_id)
     await handle_chat_message(app, reply_to_bot("Борис Б.", boris, contract, chat=chat))
 
-    assert contract.state == STATE_SIGNED
+    assert contract.state == STATE_SEAL
     assert set(contract.signatures) == {"party1", "party2"}
+
+    # Карточка переехала, но создатель тот же — Анна.
+    await seal_contract(app, contract, anna)
+    assert contract.state == STATE_SIGNED
     assert bot.edits[-1]["media"].media == "signed-file-id"
     assert bot.edits[-1]["inline_message_id"] == contract.inline_message_id
     assert bot.edits[-1]["reply_markup"].inline_keyboard == []
@@ -859,8 +930,12 @@ async def test_private_chat_both_people_share_one_contract(wired):
     await handle_chat_message(
         app, reply_to_bot("Анна А.", anna, contract, chat=anna_chat, query_id="r1")
     )
-    assert contract.state == STATE_SIGNED
+    assert contract.state == STATE_SEAL
     assert {key for key in contract.signatures} == {"party1", "party2"}
+
+    # Создатель — Анна: подтверждение даты и печать.
+    await seal_contract(app, contract, anna)
+    assert contract.state == STATE_SIGNED
     assert bot.edits[-1]["media"].media == "signed-file-id"
 
 
@@ -1044,6 +1119,9 @@ async def test_dispute_terms_and_resets_signatures(wired):
     await handle_chat_message(app, reply_to_bot("Анна А.", anna, contract, chat=chat))
     await press(app, f"sg:{contract.token}:free:party2", boris, contract.inline_message_id)
     await handle_chat_message(app, reply_to_bot("Борис Б.", boris, contract, chat=chat))
+    assert contract.state == STATE_SEAL
+
+    await seal_contract(app, contract, anna)
     assert contract.state == STATE_SIGNED
     final_caption = bot.edits[-1]["media"].caption
     assert f"<blockquote>{second_terms}</blockquote>" in final_caption
@@ -1301,7 +1379,7 @@ async def test_terms_prompt_lets_anyone_propose_terms(wired):
     contract = app.store.for_chat("g-100500")
     prompt = summon.answers[-1]
     keys = [button.callback_data for row in _rows(prompt.reply_markup) for button in row]
-    assert keys == [f"ds:{contract.token}", f"dt:{contract.token}"]
+    assert keys == [f"ds:{contract.token}"], "дата ставится автоматически, кнопки нет"
     assert prompt.reply_markup.inline_keyboard[0][0].text == app.config.text(
         "buttons.propose_terms"
     )
@@ -1327,16 +1405,31 @@ async def test_terms_prompt_lets_anyone_propose_terms(wired):
 
 
 # ---------------------------------------------------------------------------
-# date on the contract
+# дата и печать: последний шаг делает создатель контракта
 # ---------------------------------------------------------------------------
 
 
-def _date_keys(result) -> list[str]:
+def _keys(result) -> list[str]:
     return [button.callback_data for row in _rows(result.reply_markup) for button in row]
 
 
+async def _signed_contract(app, creator, mate, chat=None, template_key="classic"):
+    """Контракт с двумя подписями: дальше только дата и печать."""
+    summon = FakeGuestMessage("@test_bot", creator, chat)
+    await handle_chat_message(app, summon)
+    contract = app.store.for_chat(f"g{(chat or FakeChat(-100500)).id}")
+    index = [template.key for template in app.templates()].index(template_key)
+    await press(app, f"pk:{contract.token}:{index}", creator, contract.inline_message_id)
+    for user, field in ((creator, "party1"), (mate, "party2")):
+        await press(app, f"sg:{contract.token}:{template_key}:{field}", user, contract.inline_message_id)
+        await handle_chat_message(
+            app, reply_to_bot(f"{user.first_name} подп.", user, contract, chat=chat)
+        )
+    return contract
+
+
 @pytest.mark.asyncio
-async def test_date_is_automatic_and_can_be_edited(wired):
+async def test_date_is_automatic_and_confirmed_after_signatures(wired):
     app, bot, storage = wired
     anna = FakeUser(10, first_name="Аня")
     boris = FakeUser(20, first_name="Борис")
@@ -1347,53 +1440,65 @@ async def test_date_is_automatic_and_can_be_edited(wired):
     contract = app.store.for_chat("g-100500")
     assert contract.date_text == today
     assert contract.date_auto is True
-    assert f"dt:{contract.token}" in _date_keys(summon.answers[-1])
 
-    # Кнопка даты открывает ручной ввод.
-    press_date = await press(app, f"dt:{contract.token}", anna, contract.inline_message_id)
-    assert press_date.answers[-1] == ""
-    prompt = bot.edits[-1]["media"].caption
-    assert today in prompt
-    assert [button.callback_data for row in bot.edits[-1]["reply_markup"].inline_keyboard
-            for button in row] == [f"cx:{contract.token}"]
+    # До подписей кнопки даты нет: дата ставится автоматически.
+    assert all(not key.startswith(("dt:", "slc:", "sl:")) for key in _keys(summon.answers[-1]))
+    await press(app, f"pk:{contract.token}:0", anna, contract.inline_message_id)
+    contract_keys = [
+        button.callback_data
+        for row in bot.edits[-1]["reply_markup"].inline_keyboard
+        for button in row
+    ]
+    assert all(not key.startswith(("dt:", "slc:", "sl:")) for key in contract_keys)
 
-    # Ручная дата сохраняется и переживает перерисовку.
+    await press(app, f"sg:{contract.token}:classic:party1", anna, contract.inline_message_id)
+    await handle_chat_message(app, reply_to_bot("Аня", anna, contract))
+    await press(app, f"sg:{contract.token}:classic:party2", boris, contract.inline_message_id)
+    await handle_chat_message(
+        app, reply_to_bot("Боря", boris, contract, query_id="sign2")
+    )
+
+    # После последней подписи — подтверждение даты, а не готовый контракт.
+    assert contract.state == STATE_SEAL
+    seal_keys = [
+        button.callback_data
+        for row in bot.edits[-1]["reply_markup"].inline_keyboard
+        for button in row
+    ]
+    assert seal_keys == [f"slc:{contract.token}", f"dt:{contract.token}"]
+
+    # Создатель вписывает свою дату: подтверждение снова нужно.
+    await press(app, f"dt:{contract.token}", anna, contract.inline_message_id)
     reply = reply_to_bot("01.02.2027", anna, contract, query_id="date1")
     await handle_chat_message(app, reply)
     assert contract.date_text == "01.02.2027"
     assert contract.date_auto is False
     assert contract.date_user_id == anna.id
+    assert contract.date_confirmed is False
     assert "01.02.2027" in reply.answers[-1].input_message_content.message_text
-    assert contract.state == STATE_PREVIEW
 
-    # Выбираем бланк: в кнопках — уже ручная дата.
-    pick = await press(app, f"pk:{contract.token}:0", anna, contract.inline_message_id)
-    assert pick.answers[-1] == ""
-    keys = [
+    confirm = await press(app, f"slc:{contract.token}", anna, contract.inline_message_id)
+    assert confirm.answers[-1] == ""
+    assert contract.date_confirmed is True
+    stamp_keys = [
         button.callback_data
         for row in bot.edits[-1]["reply_markup"].inline_keyboard
         for button in row
     ]
-    assert f"dt:{contract.token}" in keys
-    assert any("01.02.2027" in button.text for row in bot.edits[-1]["reply_markup"].inline_keyboard
-               for button in row)
+    assert stamp_keys == [f"sl:{contract.token}"]
 
-    # Подписи обеих сторон: в финале напечатана ручная дата.
-    await press(app, f"sg:{contract.token}:classic:party1", anna, contract.inline_message_id)
-    first = reply_to_bot("Аня", anna, contract, query_id="sign1")
-    await handle_chat_message(app, first)
-
-    await press(app, f"sg:{contract.token}:classic:party2", boris, contract.inline_message_id)
-    second = reply_to_bot("Боря", boris, contract, query_id="sign2")
-    await handle_chat_message(app, second)
-
+    await press(app, f"sl:{contract.token}", anna, contract.inline_message_id)
     assert contract.state == STATE_SIGNED
+    assert contract.stamp_user_id == anna.id
+    assert contract.is_stamped
+
     template = app.config.templates.get("classic")
     expected = render_contract(
         template,
         {"party1": "Аня", "party2": "Боря"},
         date="01.02.2027",
         settings=app.settings.render,
+        stamped=True,
     )
     assert storage.archive[-1]["data"] == expected
     assert "01.02.2027" in storage.archive[-1]["caption"]
@@ -1403,11 +1508,9 @@ async def test_date_is_automatic_and_can_be_edited(wired):
 async def test_auto_date_returns_with_word_auto(wired):
     app, _bot, _storage = wired
     anna = FakeUser(10, first_name="Аня")
+    boris = FakeUser(20, first_name="Борис")
     today = default_date(app.settings.dates)
-
-    summon = FakeGuestMessage("@test_bot", anna)
-    await handle_chat_message(app, summon)
-    contract = app.store.for_chat("g-100500")
+    contract = await _signed_contract(app, anna, boris)
 
     await press(app, f"dt:{contract.token}", anna, contract.inline_message_id)
     reply = reply_to_bot("05.05.2030", anna, contract, query_id="date2")
@@ -1427,9 +1530,8 @@ async def test_auto_date_returns_with_word_auto(wired):
 async def test_bad_date_is_rejected_without_changing_contract(wired):
     app, _bot, _storage = wired
     anna = FakeUser(10, first_name="Аня")
-    summon = FakeGuestMessage("@test_bot", anna)
-    await handle_chat_message(app, summon)
-    contract = app.store.for_chat("g-100500")
+    boris = FakeUser(20, first_name="Борис")
+    contract = await _signed_contract(app, anna, boris)
     before = contract.date_text
 
     await press(app, f"dt:{contract.token}", anna, contract.inline_message_id)
@@ -1442,55 +1544,115 @@ async def test_bad_date_is_rejected_without_changing_contract(wired):
 
 
 @pytest.mark.asyncio
-async def test_anyone_can_change_the_date(wired):
+async def test_only_creator_confirms_date_and_stamps(wired):
+    """Дату и печать ставит создатель; остальные получают отказ."""
     app, _bot, _storage = wired
     anna = FakeUser(10, first_name="Аня")
     boris = FakeUser(20, first_name="Борис")
-    summon = FakeGuestMessage("@test_bot", anna)
-    await handle_chat_message(app, summon)
-    contract = app.store.for_chat("g-100500")
+    contract = await _signed_contract(app, anna, boris)
 
-    # Борис не вызывал бота, но дату поменять может, как и условия.
-    await press(app, f"dt:{contract.token}", boris, contract.inline_message_id)
-    reply = reply_to_bot("09.09.2029", boris, contract, query_id="date5")
-    await handle_chat_message(app, reply)
-    assert contract.date_text == "09.09.2029"
-    assert contract.date_user_id == boris.id
+    denied_date = await press(app, f"dt:{contract.token}", boris, contract.inline_message_id)
+    assert denied_date.answers[-1] == app.config.text("callback.not_creator")
+    assert app.store.pending_date_for(boris.id) is None
+
+    denied_confirm = await press(app, f"slc:{contract.token}", boris, contract.inline_message_id)
+    assert denied_confirm.answers[-1] == app.config.text("callback.not_creator")
+
+    denied_stamp = await press(app, f"sl:{contract.token}", boris, contract.inline_message_id)
+    assert denied_stamp.answers[-1] == app.config.text("callback.not_creator")
+    assert contract.state == STATE_SEAL
 
 
 @pytest.mark.asyncio
-async def test_date_button_on_terms_prompt_returns_to_terms(wired):
+async def test_stamp_requires_confirmed_date(wired):
+    app, _bot, _storage = wired
+    anna = FakeUser(10, first_name="Аня")
+    boris = FakeUser(20, first_name="Борис")
+    contract = await _signed_contract(app, anna, boris)
+
+    early = await press(app, f"sl:{contract.token}", anna, contract.inline_message_id)
+    assert early.answers[-1] == app.config.text("callback.date_first")
+    assert contract.state == STATE_SEAL
+
+    await press(app, f"slc:{contract.token}", anna, contract.inline_message_id)
+    await press(app, f"sl:{contract.token}", anna, contract.inline_message_id)
+    again = await press(app, f"sl:{contract.token}", anna, contract.inline_message_id)
+    assert again.answers[-1] == app.config.text("callback.stamped")
+
+
+@pytest.mark.asyncio
+async def test_stamp_by_creator_updates_archive(wired):
+    app, bot, storage = wired
+    anna = FakeUser(10, first_name="Аня", username="anna")
+    boris = FakeUser(20, first_name="Борис")
+    contract = await _signed_contract(app, anna, boris)
+
+    await press(app, f"slc:{contract.token}", anna, contract.inline_message_id)
+    await press(app, f"sl:{contract.token}", anna, contract.inline_message_id)
+
+    assert storage.archive, "копия владельцу должна остаться"
+    assert contract.is_stamped and contract.stamped_at
+    assert "Печать" in bot.edits[-1]["media"].caption or "Подписано" in bot.edits[-1]["media"].caption
+    assert bot.edits[-1]["reply_markup"].inline_keyboard == []
+
+
+@pytest.mark.asyncio
+async def test_date_change_keeps_terms(wired):
+    """На бланке с условиями дата уточняется после подписей, условия остаются."""
     app, bot, _storage = wired
     anna = FakeUser(10, first_name="Аня")
+    boris = FakeUser(20, first_name="Борис")
+    terms = "Заказчик платит 1000 ₽."
+
     summon = FakeGuestMessage("@test_bot условия", anna)
     await handle_chat_message(app, summon)
     contract = app.store.for_chat("g-100500")
     assert contract.state == STATE_TERMS
     prompt = summon.answers[-1]
-    assert f"dt:{contract.token}" in _date_keys(prompt)
-    assert f"ds:{contract.token}" in _date_keys(prompt)
+    assert all(not key.startswith("dt:") for key in _keys(prompt)), "дату до подписей не меняем"
+
+    await handle_chat_message(app, reply_to_bot(terms, anna, contract))
+    await press(app, f"sg:{contract.token}:free:party1", anna, contract.inline_message_id)
+    await handle_chat_message(app, reply_to_bot("Анна А.", anna, contract))
+    await press(app, f"sg:{contract.token}:free:party2", boris, contract.inline_message_id)
+    await handle_chat_message(app, reply_to_bot("Борис Б.", boris, contract))
+    assert contract.state == STATE_SEAL
 
     await press(app, f"dt:{contract.token}", anna, contract.inline_message_id)
     reply = reply_to_bot("07.07.2028", anna, contract, query_id="date6")
     await handle_chat_message(app, reply)
     assert contract.date_text == "07.07.2028"
-    assert contract.state == STATE_TERMS
-    assert contract.blank_file_id is None
-    assert "условиями" in bot.edits[-1]["media"].caption
+    assert contract.terms == terms, "условия не потерялись"
+    assert contract.state == STATE_SEAL
+    card = bot.edits[-1]["media"].caption
+    assert f"<blockquote>{terms}</blockquote>" in card or "Дата" in card
 
 
 @pytest.mark.asyncio
 async def test_member_mode_date_edit(wired):
-    """Бот в чате: дата меняется кнопкой на обычном сообщении."""
+    """Бот в чате: дата меняется кнопкой на обычном сообщении после подписей."""
     app, _bot, _storage = wired
     chat = FakeChat(-100777)
     anna = FakeUser(10, first_name="Аня")
+    boris = FakeUser(20, first_name="Борис")
     bot_user = FakeUser(999, first_name="Bot", is_bot=True, username="test_bot")
 
-    summon = FakeChatMessage("@test_bot", anna, chat)
-    await handle_chat_message(app, summon)
+    await handle_chat_message(app, FakeChatMessage("@test_bot", anna, chat))
     contract = app.store.for_chat("g-100777")
     card_id = contract.message_id
+
+    for user, field in ((anna, "party1"), (boris, "party2")):
+        await press(app, f"sg:{contract.token}:classic:{field}", user)
+        await handle_chat_message(
+            app,
+            FakeChatMessage(
+                f"{user.first_name} подп.",
+                user,
+                chat,
+                reply_to=types.SimpleNamespace(from_user=bot_user, message_id=card_id),
+            ),
+        )
+    assert contract.state == STATE_SEAL
 
     query = FakeCallback(f"dt:{contract.token}", anna)
     query.inline_message_id = None
@@ -1514,7 +1676,7 @@ async def test_member_mode_date_edit(wired):
 
 @pytest.mark.asyncio
 async def test_private_chat_date_edit(wired):
-    """Личка двух людей: второй участник вписывает дату в своей «версии» чата."""
+    """Личка двух людей: дату подтверждает создатель в своей «версии» чата."""
     app, _bot, _storage = wired
     anna = FakeUser(10, first_name="Аня", username="anna")
     boris = FakeUser(20, first_name="Борис", username="boris")
@@ -1523,12 +1685,75 @@ async def test_private_chat_date_edit(wired):
 
     await handle_chat_message(app, FakeGuestMessage("@test_bot", anna, anna_chat))
     contract = app.store.for_chat("p10:20")
+    await press(app, f"pk:{contract.token}:0", anna, contract.inline_message_id)
+    await press(app, f"sg:{contract.token}:classic:party1", anna, contract.inline_message_id)
+    await handle_chat_message(
+        app, reply_to_bot("Анна А.", anna, contract, chat=anna_chat)
+    )
+    await press(app, f"sg:{contract.token}:classic:party2", boris, contract.inline_message_id)
+    await handle_chat_message(
+        app, reply_to_bot("Борис Б.", boris, contract, chat=boris_chat)
+    )
+    assert contract.state == STATE_SEAL
 
-    await press(app, f"dt:{contract.token}", boris, contract.inline_message_id)
-    reply = reply_to_bot("03.03.2030", boris, contract, chat=boris_chat, query_id="date7")
+    # Не создатель — отказ, даже в своей версии чата.
+    denied = await press(app, f"dt:{contract.token}", boris, contract.inline_message_id)
+    assert denied.answers[-1] == app.config.text("callback.not_creator")
+
+    await press(app, f"dt:{contract.token}", anna, contract.inline_message_id)
+    reply = reply_to_bot("03.03.2030", anna, contract, chat=anna_chat, query_id="date7")
     await handle_chat_message(app, reply)
     assert contract.date_text == "03.03.2030"
-    assert contract.date_user_id == boris.id
+    assert contract.date_user_id == anna.id
+
+
+@pytest.mark.asyncio
+async def test_dispute_closed_after_all_signatures(wired):
+    """Оспорить условия можно только до последней подписи."""
+    app, _bot, _storage = wired
+    anna = FakeUser(10, first_name="Аня")
+    boris = FakeUser(20, first_name="Борис")
+    chat = FakeChat(-100500)
+    contract = await _free_contract(app, anna, chat, "Заказчик платит 1000 ₽.")
+
+    await press(app, f"sg:{contract.token}:free:party1", anna, contract.inline_message_id)
+    await handle_chat_message(app, reply_to_bot("Анна А.", anna, contract, chat=chat))
+
+    # Пока подписан не все — оспаривать можно.
+    allowed = await press(app, f"ds:{contract.token}", boris, contract.inline_message_id)
+    assert allowed.answers[-1] == ""
+    await press(app, f"cx:{contract.token}", boris, contract.inline_message_id)
+
+    await press(app, f"sg:{contract.token}:free:party2", boris, contract.inline_message_id)
+    await handle_chat_message(app, reply_to_bot("Борис Б.", boris, contract, chat=chat))
+    assert contract.state == STATE_SEAL
+
+    late = await press(app, f"ds:{contract.token}", anna, contract.inline_message_id)
+    assert late.answers[-1] == app.config.text("callback.all_signed")
+    assert app.store.pending_terms_for(anna.id) is None
+    assert contract.terms == "Заказчик платит 1000 ₽."
+
+
+@pytest.mark.asyncio
+async def test_seal_card_survives_repost(wired):
+    """Повторное @бот на финальном шаге переносит карточку, а не начинает заново."""
+    app, bot, _storage = wired
+    anna = FakeUser(10, first_name="Аня")
+    boris = FakeUser(20, first_name="Борис")
+    chat = FakeChat(-100500)
+    contract = await _signed_contract(app, anna, boris, chat=chat)
+
+    await handle_chat_message(app, FakeGuestMessage("@test_bot", boris, chat, query_id="q2"))
+    assert app.store.for_chat("g-100500") is contract
+    assert contract.state == STATE_SEAL
+    assert contract.signatures.keys() == {"party1", "party2"}
+    keys = [
+        button.callback_data
+        for row in bot.edits[-1]["reply_markup"].inline_keyboard
+        for button in row
+    ]
+    # Карточка переехала через reply_with_photo — смотрим на неё же.
+    assert keys == [f"slc:{contract.token}", f"dt:{contract.token}"]
 
 
 @pytest.mark.asyncio
@@ -1553,3 +1778,67 @@ async def test_dated_blank_is_uploaded_once_per_date(wired):
     assert await app.blank_file_id(second, template) == "file-classic"
     assert await app.blank_file_id(other, template) == "file-classic"
     assert calls == ["classic", "classic"]
+
+
+@pytest.mark.asyncio
+async def test_auto_date_is_refreshed_on_confirmation(wired):
+    """Автоматическая дата фиксируется на момент подтверждения, а не вызова."""
+    app, _bot, _storage = wired
+    anna = FakeUser(10, first_name="Аня")
+    boris = FakeUser(20, first_name="Борис")
+    contract = await _signed_contract(app, anna, boris)
+
+    contract.date_text = "01.01.2020"  # как будто подписывали давно
+    assert contract.date_auto is True
+    await press(app, f"slc:{contract.token}", anna, contract.inline_message_id)
+    assert contract.date_text == default_date(app.settings.dates)
+
+
+@pytest.mark.asyncio
+async def test_blank_without_dates_goes_straight_to_stamp(wired):
+    """Если у бланка нет даты, подтверждать нечего: сразу печать."""
+    import dataclasses
+
+    app, _bot, _storage = wired
+    anna = FakeUser(10, first_name="Аня")
+    boris = FakeUser(20, first_name="Борис")
+    classic = app.config.templates.get("classic")
+    no_dates = dataclasses.replace(
+        classic,
+        key="nodates",
+        dates=None,
+        fields={
+            key: dataclasses.replace(field, date=None)
+            for key, field in classic.fields.items()
+        },
+    )
+    app.config.templates.items["nodates"] = no_dates
+
+    contract = await _signed_contract(app, anna, boris, template_key="nodates")
+    assert contract.state == STATE_SEAL
+    assert app.seal_needs_date(contract, no_dates) is False
+
+    stamp = await press(app, f"sl:{contract.token}", anna, contract.inline_message_id)
+    assert stamp.answers[-1] == app.config.text("guest.stamp_complete")
+    assert contract.state == STATE_SIGNED
+
+
+@pytest.mark.asyncio
+async def test_blank_without_stamp_finishes_after_date(wired):
+    """Бланк без печати: подтверждённая дата сразу даёт готовый контракт."""
+    import dataclasses
+
+    app, _bot, storage = wired
+    anna = FakeUser(10, first_name="Аня")
+    boris = FakeUser(20, first_name="Борис")
+    classic = app.config.templates.get("classic")
+    plain = dataclasses.replace(classic, key="plain", stamp=None, stamp_off=True)
+    app.config.templates.items["plain"] = plain
+
+    contract = await _signed_contract(app, anna, boris, template_key="plain")
+    assert contract.state == STATE_SEAL
+    await press(app, f"slc:{contract.token}", anna, contract.inline_message_id)
+
+    assert contract.state == STATE_SIGNED
+    assert contract.is_stamped is False
+    assert storage.archive, "копия владельцу уходит и без печати"

@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from app.config import ConfigError, ConfigManager, load_settings, load_templates, Limits
+from app.config import ConfigError, ConfigManager, Limits, load_settings, load_templates
 
 
 def copy_config(tmp_path: Path) -> Path:
@@ -416,3 +416,136 @@ def test_unknown_timezone_is_rejected(tmp_path: Path, monkeypatch):
     )
     with pytest.raises(ConfigError):
         load_settings(path)
+
+
+# ---------------------------------------------------------------------------
+# печать
+# ---------------------------------------------------------------------------
+
+
+def test_stamp_has_sensible_defaults():
+    templates = load_templates(strict=True)
+    for template in templates.ordered():
+        stamp = template.stamp
+        assert stamp is not None, f"{template.key}: печать есть у каждого бланка"
+        width, height = template.canvas
+        assert 0 < stamp.radius < min(width, height) // 3
+        assert stamp.center[0] - stamp.radius >= 0
+        assert stamp.center[1] - stamp.radius >= 0
+        assert stamp.center[0] + stamp.radius <= width
+        assert stamp.center[1] + stamp.radius <= height
+        assert template.stamp_rule is stamp
+
+
+def test_stamp_can_be_disabled():
+    templates = load_templates(strict=True)
+    classic = templates.get("classic")
+    assert classic.stamp is not None
+    # stamp_rule не подставляет дефолт, если печать отключена явно.
+    assert classic.stamp_rule is not None
+
+
+def test_custom_stamp_is_parsed(tmp_path: Path):
+    background = Path(__file__).resolve().parent.parent / "templates" / "classic.png"
+    source = tmp_path / "custom.yaml"
+    source.write_text(
+        f"""
+templates:
+  sealed:
+    title: "С печатью"
+    background: {background}
+    canvas: [1000, 1400]
+    stamp:
+      center: [800, 1200]
+      radius: 70
+      color: "#8b2f1d"
+      text: "СКРЕПЛЕНО"
+      subtext: "ДОГОВОР"
+      line_width: 6
+      alpha: 0.8
+    fields:
+      party1:
+        box: [80, 1000, 380, 120]
+""",
+        encoding="utf-8",
+    )
+    templates = load_templates(extra_paths=[source], strict=True)
+    stamp = templates.get("sealed").stamp
+    assert stamp is not None
+    assert stamp.center == (800, 1200)
+    assert stamp.radius == 70
+    assert stamp.color == "#8b2f1d"
+    assert stamp.text == "СКРЕПЛЕНО"
+    assert stamp.line_width == 6
+    assert stamp.alpha == 0.8
+
+
+def test_stamp_disabled_and_bad_color(tmp_path: Path):
+    background = Path(__file__).resolve().parent.parent / "templates" / "classic.png"
+    good = tmp_path / "good.yaml"
+    good.write_text(
+        f"""
+templates:
+  no_stamp:
+    title: "Без печати"
+    background: {background}
+    canvas: [1000, 1400]
+    stamp: {{enabled: false}}
+    fields:
+      party1:
+        box: [80, 1000, 380, 120]
+""",
+        encoding="utf-8",
+    )
+    templates = load_templates(extra_paths=[good], strict=True)
+    assert templates.get("no_stamp").stamp is None
+    assert templates.get("no_stamp").stamp_rule is None
+
+    bad = tmp_path / "bad.yaml"
+    bad.write_text(
+        f"""
+templates:
+  bad_stamp:
+    title: "Кривая печать"
+    background: {background}
+    canvas: [1000, 1400]
+    stamp:
+      color: "не цвет"
+    fields:
+      party1:
+        box: [80, 1000, 380, 120]
+""",
+        encoding="utf-8",
+    )
+    with pytest.raises(ConfigError):
+        load_templates(extra_paths=[bad], strict=True)
+
+
+def test_stamp_outside_canvas_is_clamped(tmp_path: Path):
+    background = Path(__file__).resolve().parent.parent / "templates" / "classic.png"
+    source = tmp_path / "custom.yaml"
+    source.write_text(
+        f"""
+templates:
+  edge:
+    title: "У края"
+    background: {background}
+    canvas: [1000, 1400]
+    stamp:
+      center: [10, 10]
+      radius: 90
+    fields:
+      party1:
+        box: [80, 1000, 380, 120]
+""",
+        encoding="utf-8",
+    )
+    warnings: list[str] = []
+    templates = load_templates(extra_paths=[source], warnings=warnings)
+    stamp = templates.get("edge").stamp
+    assert stamp is not None
+    assert stamp.center == (90, 90), "печать прижали к краю бланка"
+    assert any("выходит за бланк" in warning for warning in warnings)
+
+    with pytest.raises(ConfigError):
+        load_templates(extra_paths=[source], strict=True)

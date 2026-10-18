@@ -83,7 +83,7 @@ TERMS_SAMPLE = (
     "пяти рабочих дней после приёмки. Правки согласуются в переписке."
 )
 
-BUTTON_CASES = ("default", "long", "self_signed")
+BUTTON_CASES = ("default", "long", "self_signed", "stamped")
 
 
 def _font(path: Path, size: int) -> ImageFont.FreeTypeFont:
@@ -610,6 +610,20 @@ def cmd_check(args: argparse.Namespace) -> int:
                     f"    terms: {count_graphemes(TERMS_SAMPLE)} симв. → "
                     f"кегль {layout.font_size}, строк {len(layout.lines)}"
                 )
+        stamp = template.stamp_rule
+        if stamp is not None:
+            if (
+                stamp.center[0] - stamp.radius < 0
+                or stamp.center[1] - stamp.radius < 0
+                or stamp.center[0] + stamp.radius > width
+                or stamp.center[1] + stamp.radius > height
+            ):
+                problems.append(f"{template.key}.stamp: печать выходит за бланк")
+            else:
+                print(
+                    f"    stamp: {stamp.text!r} в ({stamp.center[0]},{stamp.center[1]}), "
+                    f"радиус {stamp.radius}"
+                )
         if template.note is not None:
             note_text = self_sign_note(texts)
             if layout_text(note_text, template.note.box, template.note.style) is None:
@@ -687,6 +701,7 @@ def cmd_render(args: argparse.Namespace) -> int:
                     terms=TERMS_SAMPLE if template.terms is not None else None,
                     date=default_date(dates),
                     settings=render_settings,
+                    stamped=mode == "stamped",
                 )
             except RenderError as exc:
                 print(f"  ✗ {template.key} [{mode}]: {exc}")

@@ -16,25 +16,26 @@ from aiogram.enums import ParseMode
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     InlineKeyboardMarkup,
-    InlineQueryResultCachedPhoto,
     InlineQueryResultArticle,
+    InlineQueryResultCachedPhoto,
     InputMediaPhoto,
     InputTextMessageContent,
     Message,
 )
 
+from . import ui
 from .config import ConfigManager, TemplateConfig
 from .render import RenderError, clear_caches, default_date, render_contract
+from .storage import TemplateStorage
 from .store import (
-    Contract,
-    ContractStore,
     STATE_OPEN,
     STATE_PREVIEW,
+    STATE_SEAL,
     STATE_SIGNED,
     STATE_TERMS,
+    Contract,
+    ContractStore,
 )
-from .storage import TemplateStorage
-from . import ui
 
 log = logging.getLogger(__name__)
 
@@ -210,10 +211,6 @@ class App:
         """Дата на бланке: ручная, если её вписали, иначе сегодняшняя."""
         return contract.date_text or default_date(self.settings.dates)
 
-    def date_button_text(self, contract: Contract, template: TemplateConfig) -> str:
-        """Подпись на кнопке даты; пусто — кнопки не будет вовсе."""
-        return self.contract_date(contract) if template.uses_dates else ""
-
     def date_max_length(self, template: TemplateConfig) -> int:
         rule = template.date_rule
         return rule.style.max_length if rule is not None else 40
@@ -384,15 +381,34 @@ class App:
                 self.signed_markup(contract, template),
                 file_id=file_id,
             )
+        elif contract.state == STATE_SEAL:
+            date = self.contract_date(contract)
+            if self.seal_needs_date(contract, template):
+                caption = ui.seal_caption(
+                    self.config,
+                    template,
+                    date,
+                    need_date=True,
+                    author=contract.initiator_name,
+                )
+            else:
+                caption = ui.seal_ready_caption(
+                    self.config, template, date, need_date=template.uses_dates
+                )
+            ok = await self.reply_with_photo(
+                message,
+                contract,
+                template,
+                caption,
+                self.seal_markup(contract, template),
+            )
         elif contract.state == STATE_TERMS and template.terms is not None:
             ok = await self.reply_with_photo(
                 message,
                 contract,
                 template,
                 ui.terms_prompt(self.config, template, template.terms_max_length),
-                ui.terms_prompt_markup(
-                    self.config, contract.token, date=self.date_button_text(contract, template)
-                ),
+                ui.terms_prompt_markup(self.config, contract.token),
             )
         else:
             templates = self.templates()
@@ -411,7 +427,6 @@ class App:
                     contract.token,
                     index,
                     len(templates),
-                    date=self.date_button_text(contract, shown),
                 ),
             )
 
@@ -452,11 +467,16 @@ class App:
     # -- blank captions and buttons ---------------------------------------
 
     def can_dispute(self, contract: Contract, template: TemplateConfig) -> bool:
-        """Оспорить можно только уже напечатанные свободные условия."""
+        """Оспорить можно свободные условия — и только до всех подписей.
+
+        Подписей ровно столько, сколько сторон: как только подписаны все,
+        оспаривать нечего — контракт ждёт дату и печать.
+        """
         return (
             template.terms is not None
             and bool(contract.terms)
-            and contract.state != STATE_SIGNED
+            and contract.state not in {STATE_SEAL, STATE_SIGNED}
+            and len(contract.signatures) < len(template.fields)
         )
 
     def contract_caption(self, contract: Contract, template: TemplateConfig) -> str:
@@ -477,7 +497,6 @@ class App:
             template,
             set(contract.signatures),
             dispute=self.can_dispute(contract, template),
-            date=self.date_button_text(contract, template),
         )
 
     async def send_preview(
@@ -497,7 +516,6 @@ class App:
                 contract.token,
                 index,
                 total,
-                date=self.date_button_text(contract, template),
             ),
         )
 
@@ -514,9 +532,7 @@ class App:
             contract,
             template,
             ui.terms_prompt(self.config, template, template.terms_max_length),
-            ui.terms_prompt_markup(
-                self.config, contract.token, date=self.date_button_text(contract, template)
-            ),
+            ui.terms_prompt_markup(self.config, contract.token),
         )
 
     async def edit_terms_prompt(
@@ -530,9 +546,7 @@ class App:
             contract,
             template,
             ui.terms_prompt(self.config, template, template.terms_max_length),
-            ui.terms_prompt_markup(
-                self.config, contract.token, date=self.date_button_text(contract, template)
-            ),
+            ui.terms_prompt_markup(self.config, contract.token),
         )
 
     async def show_terms_contract(
@@ -624,7 +638,6 @@ class App:
                 contract.token,
                 index,
                 total,
-                date=self.date_button_text(contract, template),
             ),
         )
 
@@ -640,7 +653,6 @@ class App:
                 self.config,
                 contract.token,
                 template,
-                date=self.date_button_text(contract, template),
             ),
         )
 
@@ -727,6 +739,54 @@ class App:
             ui.date_markup(self.config, contract.token),
         )
 
+    def seal_needs_date(self, contract: Contract, template: TemplateConfig) -> bool:
+        """Нужно ли ещё подтверждение даты перед печатью."""
+        return template.uses_dates and not contract.date_confirmed
+
+    def seal_markup(self, contract: Contract, template: TemplateConfig) -> InlineKeyboardMarkup:
+        return ui.seal_markup(
+            self.config,
+            contract.token,
+            need_date=self.seal_needs_date(contract, template),
+        )
+
+    async def show_seal_card(self, contract: Contract, template: TemplateConfig) -> bool:
+        """Показать «все подписали»: дата, подтверждение и печать.
+
+        Это ещё не готовый контракт: картинка обновится только после печати.
+        """
+        contract.state = STATE_SEAL
+        contract.touch()
+        date = self.contract_date(contract)
+        if self.seal_needs_date(contract, template):
+            caption = ui.seal_caption(
+                self.config,
+                template,
+                date,
+                need_date=True,
+                author=contract.initiator_name,
+            )
+        else:
+            caption = ui.seal_ready_caption(
+                self.config, template, date, need_date=template.uses_dates
+            )
+        return await self.edit_contract(
+            contract, template, caption, self.seal_markup(contract, template)
+        )
+
+    async def confirm_seal_date(self, contract: Contract, template: TemplateConfig) -> bool:
+        """Создатель подтвердил дату: фиксируем её и показываем кнопку печати."""
+        if contract.date_auto:
+            # Автоматическая дата — это «сегодня на момент подписания»,
+            # а не дата вызова бота: подписывать могли и через сутки.
+            contract.date_text = default_date(self.settings.dates)
+        contract.date_confirmed = True
+        contract.touch()
+        if template.stamp_rule is None:
+            # Бланку печать не положена: подтверждённая дата и есть финал.
+            return await self.finalize(contract, template)
+        return await self.show_seal_card(contract, template)
+
     async def mark_expired(self, contract: Contract) -> None:
         template = self.template_or_first(contract.template_key)
         if template is None:
@@ -741,6 +801,8 @@ class App:
     async def restore_contract_view(self, contract: Contract, template: TemplateConfig) -> None:
         if contract.state == STATE_PREVIEW:
             await self.show_preview_page(contract, contract.page)
+        elif contract.state == STATE_SEAL:
+            await self.show_seal_card(contract, template)
         elif contract.state == STATE_TERMS and template.terms is not None and not contract.terms:
             await self.edit_terms_prompt(contract, template)
         else:
@@ -753,7 +815,20 @@ class App:
 
     # -- finishing ---------------------------------------------------------
 
-    async def finalize(self, contract: Contract, template: TemplateConfig) -> bool:
+    async def finalize(
+        self,
+        contract: Contract,
+        template: TemplateConfig,
+        *,
+        stamp: bool = False,
+        user_id: int = 0,
+    ) -> bool:
+        """Собрать готовый контракт.
+
+        ``stamp=True`` — финал после печати: на картинке подписи, дата и
+        печать. Без печати готовым контракт не считается, поэтому этот
+        вызов идёт только из обработчика кнопки «Поставить печать».
+        """
         signature_texts = {key: sig.text for key, sig in contract.signatures.items()}
         self_signed = contract.same_signers()
         note = self.config.text("guest.self_sign_note") if self_signed else None
@@ -765,6 +840,7 @@ class App:
                 terms=contract.terms or None,
                 date=self.contract_date(contract),
                 settings=self.settings.render,
+                stamped=stamp,
             )
         except RenderError as exc:
             log.error("Ошибка рендера контракта %s: %s", contract.token, exc)
@@ -787,6 +863,7 @@ class App:
             note or "",
             terms=contract.terms,
             author=contract.terms_author_name,
+            date=self.contract_date(contract) if template.uses_dates else "",
         )
         if not contract.has_message:
             log.warning("Контракт %s подписан, но сообщение уже недоступно", contract.token)
@@ -812,8 +889,11 @@ class App:
         # Keep the finished contract in RAM until TTL so stale buttons answer
         # "уже подписан" instead of silently starting a new one. Only signature
         # text is stored — the image is rendered on demand.
-        contract.state = STATE_SIGNED
-        contract.touch()
+        if stamp:
+            self.store.mark_stamped(contract, user_id)
+        else:
+            contract.state = STATE_SIGNED
+            contract.touch()
         return True
 
     # -- housekeeping ------------------------------------------------------

@@ -29,8 +29,8 @@ from . import ui
 from .config import TemplateConfig
 from .render import default_date, validate_date, validate_signature, validate_terms
 from .store import (
-    STATE_OPEN,
     STATE_PREVIEW,
+    STATE_SEAL,
     STATE_SIGNED,
     STATE_TERMS,
     Contract,
@@ -259,7 +259,12 @@ async def apply_signature(
     )
 
     if len(contract.signatures) >= len(template.fields):
-        ok = await app.finalize(contract, template)
+        # Готовым контракт станет только после даты и печати. Если бланку
+        # печать не положена и даты нет — подтверждать нечего, финал сразу.
+        if template.stamp_rule is None and not template.uses_dates:
+            ok = await app.finalize(contract, template)
+        else:
+            ok = await app.show_seal_card(contract, template)
         await say(app.config.text("guest.sign_complete" if ok else "guest.upload_failed"))
         return
 
@@ -303,7 +308,7 @@ async def handle_pending_text(
             f"user={user.id} token={contract.token}"
         )
         return
-    if contract.state == STATE_SIGNED:
+    if contract.state in {STATE_SEAL, STATE_SIGNED}:
         app.store.clear_pending(user.id, pending.token)
         return
     await apply_signature(app, contract, user, text, say, pending_field=pending.field_key)
@@ -401,7 +406,11 @@ async def handle_date_text(
     *,
     ignore_chat: bool = False,
 ) -> None:
-    """Вписать дату вручную или вернуть автоматическую словом «авто»."""
+    """Вписать дату вручную или вернуть автоматическую словом «авто».
+
+    Дату вписывают только после всех подписей, и только создатель контракта:
+    это подтверждение перед печатью.
+    """
     template = app.template_or_first(contract.template_key)
     if template is None:
         app.store.clear_pending_date(user.id, contract.token)
@@ -415,6 +424,14 @@ async def handle_date_text(
     if contract.state == STATE_SIGNED:
         app.store.clear_pending_date(user.id, contract.token)
         await say(app.config.text("callback.done"))
+        return
+    if contract.state != STATE_SEAL:
+        app.store.clear_pending_date(user.id, contract.token)
+        await say(app.config.text("callback.date_later"))
+        return
+    if contract.initiator_id and user.id != contract.initiator_id:
+        app.store.clear_pending_date(user.id, contract.token)
+        await say(app.config.text("callback.not_creator"))
         return
 
     key = _chat_key(message)
@@ -453,23 +470,20 @@ async def handle_date_text(
 
     contract.touch()
     app.store.clear_pending_date(user.id, contract.token)
-    # Условия уже напечатаны на картинке — перерисуем их с новой датой.
-    # Прежний file_id не сбрасываем: если загрузка не удастся, карточка
-    # останется с прежней картинкой, а не с бланком без условий.
+    # Новая дата — значит прежнее подтверждение недействительно: создатель
+    # увидит карточку снова с кнопкой «Дата верна».
+    contract.date_confirmed = False
     if template.terms is not None and contract.terms:
-        ok = await app.show_terms_contract(contract, template)
-    elif contract.state == STATE_PREVIEW:
-        ok = await app.show_preview_page(contract, contract.page)
-    elif contract.state == STATE_TERMS and template.terms is not None:
-        ok = await app.edit_terms_prompt(contract, template)
+        # Условия напечатаны на картинке — перерисуем их с новой датой.
+        # Прежний file_id не сбрасываем: если загрузка не удастся, карточка
+        # останется с прежней картинкой, а не с бланком без условий.
+        rendered = await app.show_terms_contract(contract, template)
+        # Карточку финального шага показываем в любом случае: даже если
+        # картинка не обновилась, кнопки подписей на экране быть не должно.
+        sealed = await app.show_seal_card(contract, template)
+        ok = rendered and sealed
     else:
-        contract.state = STATE_OPEN
-        ok = await app.edit_contract(
-            contract,
-            template,
-            app.contract_caption(contract, template),
-            app.signed_markup(contract, template),
-        )
+        ok = await app.show_seal_card(contract, template)
     if not ok:
         message_text += "\n" + app.config.text("errors.generic")
     app.note(f"date token={contract.token} user={user.id} auto={auto} value={contract.date_text!r}")
@@ -866,6 +880,14 @@ async def handle_callback(app: "App", query: CallbackQuery) -> None:
         await _handle_date_press(app, query, token)
         return
 
+    if action == "slc":
+        await _handle_seal_date_confirm(app, query, token)
+        return
+
+    if action == "sl":
+        await _handle_stamp(app, query, token)
+        return
+
     if action == "no":
         contract = _live_contract(app, query, token)
         if contract is None:
@@ -960,6 +982,9 @@ async def _handle_preview(
     if contract.state == STATE_SIGNED:
         await query.answer(app.config.text("callback.done"))
         return
+    if contract.state == STATE_SEAL:
+        await query.answer(app.config.text("callback.all_signed"))
+        return
 
     templates = app.templates()
     if not templates:
@@ -1023,6 +1048,9 @@ async def _handle_sign_press(
     if contract.state == STATE_SIGNED:
         await query.answer(app.config.text("callback.done"))
         return
+    if contract.state == STATE_SEAL:
+        await query.answer(app.config.text("callback.all_signed"))
+        return
     if field_key in contract.signatures:
         await query.answer(app.config.text("callback.already_signed", label=field.label))
         return
@@ -1063,6 +1091,11 @@ async def _handle_dispute(app: "App", query: CallbackQuery, token: str) -> None:
     if contract.state == STATE_SIGNED:
         await query.answer(app.config.text("callback.done"))
         return
+    if len(contract.signatures) >= len(template.fields):
+        # Все подписи уже стоят: условия оспаривать поздно, контракт ждёт
+        # подтверждения даты и печати.
+        await query.answer(app.config.text("callback.all_signed"))
+        return
 
     if not contract.terms:
         # Условий ещё нет: кнопка значит «предложить свои первым».
@@ -1092,7 +1125,7 @@ async def _handle_dispute(app: "App", query: CallbackQuery, token: str) -> None:
 
 
 async def _handle_date_press(app: "App", query: CallbackQuery, token: str) -> None:
-    """Кнопка «📅 Дата»: попросить вписать дату ответом на карточку."""
+    """«📅 Изменить дату»: попросить создателя вписать дату ответом."""
     contract = _live_contract(app, query, token)
     if contract is None:
         await query.answer(_callback_expired(app))
@@ -1108,6 +1141,13 @@ async def _handle_date_press(app: "App", query: CallbackQuery, token: str) -> No
     if contract.state == STATE_SIGNED:
         await query.answer(app.config.text("callback.done"))
         return
+    if contract.state != STATE_SEAL:
+        # Дату уточняют после всех подписей, а не в процессе.
+        await query.answer(app.config.text("callback.date_later"))
+        return
+    if contract.initiator_id and query.from_user.id != contract.initiator_id:
+        await query.answer(app.config.text("callback.not_creator"))
+        return
 
     editors = app.store.pending_terms_for_contract(contract.token)
     if any(item.user_id != query.from_user.id for item in editors):
@@ -1118,6 +1158,69 @@ async def _handle_date_press(app: "App", query: CallbackQuery, token: str) -> No
     ok = await app.show_date_prompt(contract, template)
     app.note(f"date prompt token={contract.token} user={query.from_user.id}")
     await query.answer("" if ok else app.config.text("errors.generic"))
+
+
+async def _handle_seal_date_confirm(
+    app: "App", query: CallbackQuery, token: str
+) -> None:
+    """«✅ Дата верна»: создатель подтвердил дату, теперь можно ставить печать."""
+    contract = _live_contract(app, query, token)
+    if contract is None:
+        await query.answer(_callback_expired(app))
+        return
+
+    template = app.template_or_first(contract.template_key)
+    if template is None:
+        await query.answer(_callback_expired(app))
+        return
+    if contract.state == STATE_SIGNED:
+        await query.answer(app.config.text("callback.done"))
+        return
+    if contract.state != STATE_SEAL:
+        await query.answer(app.config.text("callback.all_signed"))
+        return
+    if contract.initiator_id and query.from_user.id != contract.initiator_id:
+        await query.answer(app.config.text("callback.not_creator"))
+        return
+
+    ok = await app.confirm_seal_date(contract, template)
+    app.note(f"date confirmed token={contract.token} user={query.from_user.id}")
+    await query.answer("" if ok else app.config.text("errors.generic"))
+
+
+async def _handle_stamp(app: "App", query: CallbackQuery, token: str) -> None:
+    """«Поставить печать»: последний шаг, после него контракт готов."""
+    contract = _live_contract(app, query, token)
+    if contract is None:
+        await query.answer(_callback_expired(app))
+        return
+
+    template = app.template_or_first(contract.template_key)
+    if template is None:
+        await query.answer(_callback_expired(app))
+        return
+    if contract.state == STATE_SIGNED or contract.is_stamped:
+        await query.answer(app.config.text("callback.stamped"))
+        return
+    if contract.state != STATE_SEAL:
+        await query.answer(app.config.text("callback.all_signed"))
+        return
+    if contract.initiator_id and query.from_user.id != contract.initiator_id:
+        await query.answer(app.config.text("callback.not_creator"))
+        return
+    if app.seal_needs_date(contract, template):
+        await query.answer(app.config.text("callback.date_first"))
+        return
+
+    ok = await app.finalize(
+        contract, template, stamp=True, user_id=query.from_user.id
+    )
+    app.note(
+        f"stamped token={contract.token} user={query.from_user.id} ok={ok}"
+    )
+    await query.answer(
+        app.config.text("guest.stamp_complete") if ok else app.config.text("errors.generic")
+    )
 
 
 async def _handle_cancel(app: "App", query: CallbackQuery, token: str) -> None:

@@ -107,16 +107,31 @@ def test_every_template_fits_callback_limit(app):
                     assert len(button.callback_data.encode()) <= 64
 
 
-def test_no_date_button_when_template_has_no_dates(app):
+def test_date_and_seal_buttons_only_on_the_last_step(app):
     from app import ui
 
-    assert ui.date_button(app.config, "abcdefgh", "") is None
-    markup = ui.preview_markup(app.config, "abcdefgh", 0, 5, date="")
-    keys = [button.callback_data for row in markup.inline_keyboard for button in row]
-    assert all(not key.startswith("dt:") for key in keys)
+    # До подписей кнопки даты нет ни в одном сценарии.
+    for markup in (
+        ui.preview_markup(app.config, "abcdefgh", 0, 5),
+        ui.terms_prompt_markup(app.config, "abcdefgh"),
+    ):
+        keys = [button.callback_data for row in markup.inline_keyboard for button in row]
+        assert all(not key.startswith(("dt:", "sl:", "slc:")) for key in keys)
 
-    with_date = ui.preview_markup(
-        app.config, "abcdefgh", 0, 5, date="18.10.2026"
-    )
-    keys = [button.callback_data for row in with_date.inline_keyboard for button in row]
-    assert keys[-1] == "dt:abcdefgh"
+    template = app.config.templates.get("classic")
+    markup = ui.contract_markup(app.config, "abcdefgh", template)
+    keys = [button.callback_data for row in markup.inline_keyboard for button in row]
+    assert all(not key.startswith(("dt:", "sl:", "slc:")) for key in keys)
+
+    # Финальный шаг: сперва дата, после подтверждения — печать.
+    need_date = ui.seal_markup(app.config, "abcdefgh", need_date=True)
+    assert [
+        button.callback_data for row in need_date.inline_keyboard for button in row
+    ] == ["slc:abcdefgh", "dt:abcdefgh"]
+    ready = ui.seal_markup(app.config, "abcdefgh", need_date=False)
+    assert [button.callback_data for row in ready.inline_keyboard for button in row] == [
+        "sl:abcdefgh"
+    ]
+    # Одна кнопка в строке: ширина не скачет.
+    assert all(len(row) == 1 for row in need_date.inline_keyboard)
+    assert all(len(row) == 1 for row in ready.inline_keyboard)

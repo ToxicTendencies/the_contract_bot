@@ -89,21 +89,11 @@ def _column(buttons: list[InlineKeyboardButton]) -> list[list[InlineKeyboardButt
     return [[button] for button in buttons]
 
 
-def date_button(cfg: ConfigManager, token: str, date_text: str) -> InlineKeyboardButton | None:
-    """Кнопка «Дата: 18.10.2026» — открывает ручной ввод."""
-    if not date_text:
-        return None
-    label = _trim(_q(cfg, "buttons.date", date=date_text), 60)
-    return InlineKeyboardButton(text=label, callback_data=f"dt:{token}")
-
-
 def preview_markup(
     cfg: ConfigManager,
     token: str,
     index: int,
     total: int,
-    *,
-    date: str = "",
 ) -> InlineKeyboardMarkup:
     prev_index = (index - 1) % total
     next_index = (index + 1) % total
@@ -112,9 +102,6 @@ def preview_markup(
         InlineKeyboardButton(text=_q(cfg, "buttons.pick"), callback_data=f"pk:{token}:{index}"),
         InlineKeyboardButton(text=_q(cfg, "buttons.next"), callback_data=f"pn:{token}:{next_index}"),
     ]
-    date_btn = date_button(cfg, token, date)
-    if date_btn is not None:
-        buttons.append(date_btn)
     return InlineKeyboardMarkup(inline_keyboard=_column(buttons))
 
 
@@ -122,8 +109,6 @@ def contract_markup(
     cfg: ConfigManager,
     token: str,
     template: TemplateConfig,
-    *,
-    date: str = "",
 ) -> InlineKeyboardMarkup:
     buttons = [
         InlineKeyboardButton(
@@ -132,18 +117,13 @@ def contract_markup(
         )
         for field in template.fields.values()
     ]
-    date_btn = date_button(cfg, token, date)
-    if date_btn is not None:
-        buttons.append(date_btn)
     buttons.append(
         InlineKeyboardButton(text=_q(cfg, "buttons.cancel"), callback_data=f"cx:{token}")
     )
     return InlineKeyboardMarkup(inline_keyboard=_column(buttons))
 
 
-def terms_prompt_markup(
-    cfg: ConfigManager, token: str, *, date: str = ""
-) -> InlineKeyboardMarkup:
+def terms_prompt_markup(cfg: ConfigManager, token: str) -> InlineKeyboardMarkup:
     """Пока условий нет, их может предложить любой — кнопка видна сразу."""
     buttons = [
         InlineKeyboardButton(
@@ -151,9 +131,6 @@ def terms_prompt_markup(
             callback_data=f"ds:{token}",
         )
     ]
-    date_btn = date_button(cfg, token, date)
-    if date_btn is not None:
-        buttons.append(date_btn)
     return InlineKeyboardMarkup(inline_keyboard=_column(buttons))
 
 
@@ -164,7 +141,6 @@ def signed_buttons_markup(
     signed: set[str],
     *,
     dispute: bool = False,
-    date: str = "",
 ) -> InlineKeyboardMarkup:
     buttons: list[InlineKeyboardButton] = []
     for field in template.fields.values():
@@ -182,9 +158,6 @@ def signed_buttons_markup(
                 callback_data=f"ds:{token}",
             )
         )
-    date_btn = date_button(cfg, token, date)
-    if date_btn is not None:
-        buttons.append(date_btn)
     buttons.append(
         InlineKeyboardButton(text=_q(cfg, "buttons.cancel"), callback_data=f"cx:{token}")
     )
@@ -204,6 +177,32 @@ def date_markup(cfg: ConfigManager, token: str) -> InlineKeyboardMarkup:
     buttons = [
         InlineKeyboardButton(text=_q(cfg, "buttons.cancel"), callback_data=f"cx:{token}")
     ]
+    return InlineKeyboardMarkup(inline_keyboard=_column(buttons))
+
+
+def seal_markup(
+    cfg: ConfigManager, token: str, *, need_date: bool
+) -> InlineKeyboardMarkup:
+    """Финальный шаг: сперва подтверждение даты, потом печать.
+
+    Кнопки видит весь чат (сообщение одно на всех), но нажать их может
+    только создатель контракта — это проверяется обработчиком.
+    """
+    if need_date:
+        buttons = [
+            InlineKeyboardButton(
+                text=_q(cfg, "buttons.confirm_date"), callback_data=f"slc:{token}"
+            ),
+            InlineKeyboardButton(
+                text=_q(cfg, "buttons.change_date"), callback_data=f"dt:{token}"
+            ),
+        ]
+    else:
+        buttons = [
+            InlineKeyboardButton(
+                text=_q(cfg, "buttons.stamp"), callback_data=f"sl:{token}"
+            )
+        ]
     return InlineKeyboardMarkup(inline_keyboard=_column(buttons))
 
 
@@ -243,6 +242,32 @@ def contract_caption(
         max_length=max_length,
     )
     return with_terms(cfg, caption, terms, author=author)
+
+
+def seal_caption(
+    cfg: ConfigManager,
+    template: TemplateConfig,
+    date: str,
+    *,
+    need_date: bool,
+    author: str = "",
+) -> str:
+    """Карточка «все подписали»: чего ждём от создателя."""
+    title = html.escape(template.title)
+    if need_date:
+        key = "guest.seal_caption" if author else "guest.seal_caption_anonymous"
+        return _q(cfg, key, title=title, date=html.escape(date), author=html.escape(author))
+    key = "guest.seal_caption_no_date" if author else "guest.seal_caption_anonymous_no_date"
+    return _q(cfg, key, title=title, date=html.escape(date), author=html.escape(author))
+
+
+def seal_ready_caption(
+    cfg: ConfigManager, template: TemplateConfig, date: str, *, need_date: bool
+) -> str:
+    """Дата подтверждена — осталась печать."""
+    if need_date:
+        return _q(cfg, "guest.seal_ready", title=html.escape(template.title), date=html.escape(date))
+    return _q(cfg, "guest.seal_ready_no_date", title=html.escape(template.title))
 
 
 def date_prompt(
@@ -324,12 +349,17 @@ def done_caption(
     *,
     terms: str = "",
     author: str = "",
+    date: str = "",
 ) -> str:
     title = html.escape(template.title)
     if self_signed:
         caption = _q(cfg, "guest.done_self_caption", title=title, note=html.escape(note))
     else:
         caption = _q(cfg, "guest.done_caption", title=title)
+    if date:
+        caption = caption.rstrip() + "\n" + _q(
+            cfg, "guest.done_date_line", date=html.escape(date)
+        )
     return with_terms(cfg, caption, terms, author=author)
 
 

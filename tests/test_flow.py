@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from app.handlers import handle_callback, handle_guest, split_mention
+from app.handlers import handle_callback, handle_chat_message, split_mention
 from app.store import STATE_SIGNED
 
 from .helpers import FakeCallback, FakeChat, FakeMessage, FakeUser
@@ -47,7 +47,7 @@ def patched(app, monkeypatch):
     async def mark_expired(contract):
         calls["expired"] = True
 
-    monkeypatch.setattr(app, "post_guest_text", post_text)
+    monkeypatch.setattr(app, "post_text", post_text)
     monkeypatch.setattr(app, "send_preview", send_preview)
     monkeypatch.setattr(app, "show_preview_page", show_preview_page)
     monkeypatch.setattr(app, "show_contract", show_contract)
@@ -78,7 +78,7 @@ def test_split_mention():
 
 @pytest.mark.asyncio
 async def test_mention_creates_preview(app, patched):
-    await handle_guest(app, guest("@test_bot"))
+    await handle_chat_message(app, guest("@test_bot"))
     contract = app.store.for_chat("g-100500")
     assert contract is not None
     assert patched["preview"] == ["classic"]
@@ -87,21 +87,21 @@ async def test_mention_creates_preview(app, patched):
 
 @pytest.mark.asyncio
 async def test_mention_with_template_name(app, patched):
-    await handle_guest(app, guest("@test_bot минимализм"))
+    await handle_chat_message(app, guest("@test_bot минимализм"))
     contract = app.store.for_chat("g-100500")
     assert contract.template_key == "minimal"
 
 
 @pytest.mark.asyncio
 async def test_unknown_query(app, patched):
-    await handle_guest(app, guest("@test_bot ерунда"))
+    await handle_chat_message(app, guest("@test_bot ерунда"))
     assert app.store.for_chat("g-100500") is None
     assert patched["text"], "должно быть сообщение об ошибке"
 
 
 @pytest.mark.asyncio
 async def test_callback_paging(app, patched):
-    await handle_guest(app, guest("@test_bot"))
+    await handle_chat_message(app, guest("@test_bot"))
     contract = app.store.for_chat("g-100500")
     callback = FakeCallback(data=f"pn:{contract.token}:1", user=FakeUser(1))
     await handle_callback(app, callback)
@@ -111,7 +111,7 @@ async def test_callback_paging(app, patched):
 
 @pytest.mark.asyncio
 async def test_callback_pick_starts_contract(app, patched):
-    await handle_guest(app, guest("@test_bot"))
+    await handle_chat_message(app, guest("@test_bot"))
     contract = app.store.for_chat("g-100500")
     callback = FakeCallback(data=f"pk:{contract.token}:2", user=FakeUser(1))
     await handle_callback(app, callback)
@@ -121,7 +121,7 @@ async def test_callback_pick_starts_contract(app, patched):
 
 @pytest.mark.asyncio
 async def test_callback_sign_sets_pending(app, patched):
-    await handle_guest(app, guest("@test_bot"))
+    await handle_chat_message(app, guest("@test_bot"))
     contract = app.store.for_chat("g-100500")
     callback = FakeCallback(data=f"sg:{contract.token}:party1", user=FakeUser(7))
     await handle_callback(app, callback)
@@ -134,14 +134,14 @@ async def test_callback_sign_sets_pending(app, patched):
 
 @pytest.mark.asyncio
 async def test_signature_from_pending_user(app, patched):
-    await handle_guest(app, guest("@test_bot"))
+    await handle_chat_message(app, guest("@test_bot"))
     contract = app.store.for_chat("g-100500")
     await handle_callback(
         app, FakeCallback(data=f"sg:{contract.token}:party1", user=FakeUser(7))
     )
 
     reply = FakeMessage(text=VALID, user=FakeUser(7), guest_query_id="new-query")
-    await handle_guest(app, reply)
+    await handle_chat_message(app, reply)
     assert contract.signatures["party1"].text == VALID
     assert patched["progress"] == ["party1"]
     assert patched["final"] == []
@@ -149,12 +149,12 @@ async def test_signature_from_pending_user(app, patched):
 
 @pytest.mark.asyncio
 async def test_signature_from_stranger_is_rejected(app, patched):
-    await handle_guest(app, guest("@test_bot"))
+    await handle_chat_message(app, guest("@test_bot"))
     contract = app.store.for_chat("g-100500")
     await handle_callback(
         app, FakeCallback(data=f"sg:{contract.token}:party1", user=FakeUser(7))
     )
-    await handle_guest(
+    await handle_chat_message(
         app, FakeMessage(text=VALID, user=FakeUser(8), guest_query_id="new-query")
     )
     assert contract.signatures == {}
@@ -163,12 +163,12 @@ async def test_signature_from_stranger_is_rejected(app, patched):
 
 @pytest.mark.asyncio
 async def test_long_signature_rejected(app, patched):
-    await handle_guest(app, guest("@test_bot"))
+    await handle_chat_message(app, guest("@test_bot"))
     contract = app.store.for_chat("g-100500")
     await handle_callback(
         app, FakeCallback(data=f"sg:{contract.token}:party1", user=FakeUser(7))
     )
-    await handle_guest(
+    await handle_chat_message(
         app, FakeMessage(text=LONG, user=FakeUser(7), guest_query_id="new-query")
     )
     assert contract.signatures == {}
@@ -177,7 +177,7 @@ async def test_long_signature_rejected(app, patched):
 
 @pytest.mark.asyncio
 async def test_two_users_finish_contract(app, patched):
-    await handle_guest(app, guest("@test_bot", user_id=1))
+    await handle_chat_message(app, guest("@test_bot", user_id=1))
     contract = app.store.for_chat("g-100500")
 
     for user_id, field_key in ((7, "party1"), (8, "party2")):
@@ -185,7 +185,7 @@ async def test_two_users_finish_contract(app, patched):
             app,
             FakeCallback(data=f"sg:{contract.token}:{field_key}", user=FakeUser(user_id)),
         )
-        await handle_guest(
+        await handle_chat_message(
             app,
             FakeMessage(text=VALID, user=FakeUser(user_id), guest_query_id=f"q{user_id}"),
         )
@@ -197,13 +197,13 @@ async def test_two_users_finish_contract(app, patched):
 
 @pytest.mark.asyncio
 async def test_same_user_signs_both(app, patched):
-    await handle_guest(app, guest("@test_bot", user_id=5))
+    await handle_chat_message(app, guest("@test_bot", user_id=5))
     contract = app.store.for_chat("g-100500")
     for field_key in ("party1", "party2"):
         await handle_callback(
             app, FakeCallback(data=f"sg:{contract.token}:{field_key}", user=FakeUser(5))
         )
-        await handle_guest(
+        await handle_chat_message(
             app,
             FakeMessage(text=VALID, user=FakeUser(5), guest_query_id=f"q-{field_key}"),
         )
@@ -213,7 +213,7 @@ async def test_same_user_signs_both(app, patched):
 
 @pytest.mark.asyncio
 async def test_cancel_by_initiator(app, patched):
-    await handle_guest(app, guest("@test_bot"))
+    await handle_chat_message(app, guest("@test_bot"))
     contract = app.store.for_chat("g-100500")
     callback = FakeCallback(data=f"cx:{contract.token}", user=FakeUser(1))
     await handle_callback(app, callback)
@@ -223,7 +223,7 @@ async def test_cancel_by_initiator(app, patched):
 
 @pytest.mark.asyncio
 async def test_cancel_by_stranger_rejected(app, patched):
-    await handle_guest(app, guest("@test_bot"))
+    await handle_chat_message(app, guest("@test_bot"))
     contract = app.store.for_chat("g-100500")
     callback = FakeCallback(data=f"cx:{contract.token}", user=FakeUser(99))
     await handle_callback(app, callback)
@@ -239,7 +239,7 @@ async def test_stale_token(app, patched):
 
 @pytest.mark.asyncio
 async def test_signed_contract_rejects_callbacks(app, patched):
-    await handle_guest(app, guest("@test_bot"))
+    await handle_chat_message(app, guest("@test_bot"))
     contract = app.store.for_chat("g-100500")
     contract.state = STATE_SIGNED
     callback = FakeCallback(data=f"sg:{contract.token}:party1", user=FakeUser(1))
@@ -249,24 +249,24 @@ async def test_signed_contract_rejects_callbacks(app, patched):
 
 @pytest.mark.asyncio
 async def test_mention_with_signature_text(app, patched):
-    await handle_guest(app, guest("@test_bot"))
+    await handle_chat_message(app, guest("@test_bot"))
     contract = app.store.for_chat("g-100500")
     await handle_callback(
         app, FakeCallback(data=f"sg:{contract.token}:party1", user=FakeUser(7))
     )
     # User types the signature together with a mention instead of replying.
-    await handle_guest(app, guest("@test_bot Иванов И.И.", user_id=7))
+    await handle_chat_message(app, guest("@test_bot Иванов И.И.", user_id=7))
     assert contract.signatures["party1"].text == "Иванов И.И."
 
 
 @pytest.mark.asyncio
 async def test_template_name_wins_over_signature(app, patched):
-    await handle_guest(app, guest("@test_bot"))
+    await handle_chat_message(app, guest("@test_bot"))
     contract = app.store.for_chat("g-100500")
     await handle_callback(
         app, FakeCallback(data=f"sg:{contract.token}:party1", user=FakeUser(7))
     )
-    await handle_guest(app, guest("@test_bot минимализм", user_id=7))
+    await handle_chat_message(app, guest("@test_bot минимализм", user_id=7))
     # A known tag starts a new contract instead of becoming a signature.
     assert contract.signatures == {}
 

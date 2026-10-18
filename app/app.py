@@ -24,7 +24,14 @@ from aiogram.types import (
 
 from .config import ConfigManager, TemplateConfig
 from .render import RenderError, clear_caches, render_contract
-from .store import Contract, ContractStore, STATE_OPEN, STATE_PREVIEW, STATE_SIGNED
+from .store import (
+    Contract,
+    ContractStore,
+    STATE_OPEN,
+    STATE_PREVIEW,
+    STATE_SIGNED,
+    STATE_TERMS,
+)
 from .storage import TemplateStorage
 from . import ui
 
@@ -49,7 +56,6 @@ class App:
         self.bot_username: str = ""
         self.bot_id: int = 0
         self.guest_mode_enabled = False
-        self.inline_mode_enabled = False
         self.started_at = time.time()
         self._cleanup_task: asyncio.Task[None] | None = None
         self._warmup_lock = asyncio.Lock()
@@ -67,13 +73,11 @@ class App:
         self.bot_username = me.username or ""
         self.bot_id = me.id
         self.guest_mode_enabled = bool(getattr(me, "supports_guest_queries", False))
-        self.inline_mode_enabled = bool(getattr(me, "supports_inline_queries", False))
         log.info(
-            "Бот @%s (id=%s), inline: %s, guest: %s",
+            "Бот @%s (id=%s), guest mode: %s",
             self.bot_username,
             self.bot_id,
-            "вкл" if self.inline_mode_enabled else "выкл",
-            "вкл" if self.guest_mode_enabled else "выкл",
+            "вкл" if self.guest_mode_enabled else "ВЫКЛ",
         )
 
         ready, total = await self.storage.warmup(self.bot)
@@ -81,10 +85,10 @@ class App:
 
         self._cleanup_task = asyncio.create_task(self._cleanup_loop(), name="cleanup")
 
-        if not self.inline_mode_enabled and not self.guest_mode_enabled:
-            await self.notify_owner(self.config.text("dm.no_modes_enabled"))
-        elif not self.inline_mode_enabled:
-            await self.notify_owner(self.config.text("dm.inline_mode_disabled"))
+        if not self.guest_mode_enabled:
+            await self.notify_owner(
+                self.config.text("dm.guest_mode_disabled", bot=self.bot_username)
+            )
         if ready < total:
             await self.notify_owner(
                 self.config.text("dm.warmup_partial", ok=ready, total=total)
@@ -168,50 +172,167 @@ class App:
 
     # -- guest replies ----------------------------------------------------
 
-    async def post_guest_text(self, message: Message, text: str) -> None:
-        """Send a fresh guest message in reply to a summon."""
-        if not message.guest_query_id:
+    async def post_text(self, message: Message, text: str) -> None:
+        """Reply with text: a guest answer or a normal chat message."""
+        if message.guest_query_id:
+            result = InlineQueryResultArticle(
+                id=secrets.token_hex(8),
+                title="Сообщение",
+                input_message_content=InputTextMessageContent(
+                    message_text=text, parse_mode=ParseMode.HTML
+                ),
+            )
+            try:
+                await message.answer_guest_query(result=result)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("Не удалось ответить на guest query: %s", exc)
             return
-        result = InlineQueryResultArticle(
-            id=secrets.token_hex(8),
-            title="Сообщение",
-            input_message_content=InputTextMessageContent(
-                message_text=text, parse_mode=ParseMode.HTML
-            ),
-        )
         try:
-            await message.answer_guest_query(result=result)
+            await message.reply(text, parse_mode=ParseMode.HTML)
         except Exception as exc:  # noqa: BLE001
-            log.warning("Не удалось ответить на guest query: %s", exc)
+            log.warning("Не удалось ответить в чат: %s", exc)
+
+    async def reply_with_photo(
+        self,
+        message: Message,
+        contract: Contract,
+        template: TemplateConfig,
+        caption: str,
+        markup: InlineKeyboardMarkup | None,
+        *,
+        file_id: str | None = None,
+    ) -> bool:
+        """Send the blank with buttons and remember how to edit it later.
+
+        Guest bots answer the summon (``answerGuestQuery``), member bots send a
+        normal photo message.  Either way the contract remembers the handle:
+        ``inline_message_id`` or ``chat_id`` + ``message_id``.
+        """
+        file_id = file_id or self.storage.file_id(template.key)
+        if not file_id:
+            await self.post_text(message, self.config.text("guest.no_templates"))
+            return False
+
+        if message.guest_query_id:
+            result = InlineQueryResultCachedPhoto(
+                id=secrets.token_hex(8),
+                photo_file_id=file_id,
+                caption=caption,
+                parse_mode=ParseMode.HTML,
+                reply_markup=markup,
+            )
+            try:
+                sent = await message.answer_guest_query(result=result)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("Не удалось отправить бланк в чат: %s", exc)
+                return False
+            inline_id = getattr(sent, "inline_message_id", None)
+            if not inline_id:
+                log.warning("Guest-ответ пришёл без inline_message_id")
+                return False
+            contract.inline_message_id = inline_id
+            contract.touch()
+            return True
+
+        try:
+            sent = await message.answer_photo(
+                photo=file_id,
+                caption=caption,
+                parse_mode=ParseMode.HTML,
+                reply_markup=markup,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Не удалось отправить бланк в чат: %s", exc)
+            return False
+        chat = getattr(sent, "chat", None)
+        if chat is not None:
+            contract.chat_id = chat.id
+        contract.message_id = getattr(sent, "message_id", None)
+        contract.touch()
+        return True
 
     async def send_preview(
         self, message: Message, contract: Contract, template: TemplateConfig
-    ) -> str | None:
-        file_id = self.storage.file_id(template.key)
-        if not file_id:
-            await self.post_guest_text(message, self.config.text("guest.no_templates"))
-            return None
-
+    ) -> bool:
+        """Show the blank with the ◀ Выбрать ▶ carousel."""
         total = max(1, len(self.templates()))
         index = self.clamp_index(contract.page, total)
         contract.page = index
-        result = InlineQueryResultCachedPhoto(
-            id=secrets.token_hex(8),
-            photo_file_id=file_id,
-            caption=ui.preview_caption(self.config, template, index, total),
-            parse_mode=ParseMode.HTML,
-            reply_markup=ui.preview_markup(self.config, contract.token, index, total),
+        return await self.reply_with_photo(
+            message,
+            contract,
+            template,
+            ui.preview_caption(self.config, template, index, total),
+            ui.preview_markup(self.config, contract.token, index, total),
         )
+
+    async def send_terms_prompt(
+        self, message: Message, contract: Contract, template: TemplateConfig
+    ) -> bool:
+        """Post the blank with the "send me the terms" caption."""
+        if template.terms is None:
+            return False
+        contract.state = STATE_TERMS
+        contract.touch()
+        return await self.reply_with_photo(
+            message,
+            contract,
+            template,
+            ui.terms_prompt(self.config, template, template.terms_max_length),
+            None,
+        )
+
+    async def edit_terms_prompt(
+        self, contract: Contract, template: TemplateConfig
+    ) -> bool:
+        """Turn the current blank into the terms prompt (carousel pick)."""
+        if template.terms is None:
+            return False
+        contract.state = STATE_TERMS
+        return await self.edit_contract(
+            contract,
+            template,
+            ui.terms_prompt(self.config, template, template.terms_max_length),
+            None,
+        )
+
+    async def show_terms_contract(
+        self, contract: Contract, template: TemplateConfig
+    ) -> bool:
+        """Draw the free-form terms on the blank and show the side buttons."""
+        if template.terms is None or not contract.terms:
+            return False
         try:
-            sent = await message.answer_guest_query(result=result)
-        except Exception as exc:  # noqa: BLE001
-            log.warning("Не удалось отправить превью: %s", exc)
-            return None
-        inline_id = getattr(sent, "inline_message_id", None)
-        if inline_id:
-            contract.inline_message_id = inline_id
-            contract.touch()
-        return inline_id
+            data = render_contract(
+                template,
+                {},
+                terms=contract.terms,
+                settings=self.settings.render,
+            )
+        except RenderError:
+            log.exception("Не удалось нарисовать условия контракта %s", contract.token)
+            return False
+        try:
+            file_id = await self.storage.upload_image(
+                self.bot,
+                data,
+                f"Бланк: {html.escape(template.title)}",
+                filename="blank.jpg",
+            )
+        except Exception:  # noqa: BLE001
+            log.exception("Не удалось загрузить бланк с условиями %s", contract.token)
+            return False
+
+        contract.blank_file_id = file_id
+        contract.state = STATE_OPEN
+        return await self.edit_contract(
+            contract,
+            template,
+            ui.contract_caption(
+                self.config, template, self.max_length_for(template)
+            ),
+            ui.contract_markup(self.config, contract.token, template),
+        )
 
     # -- editing ----------------------------------------------------------
 
@@ -222,13 +343,11 @@ class App:
         caption: str,
         markup: InlineKeyboardMarkup | None,
     ) -> bool:
-        file_id = self.storage.file_id(template.key)
+        file_id = contract.blank_file_id or self.storage.file_id(template.key)
         if not file_id:
             log.warning("Нет file_id для бланка %s", template.key)
             return False
-        if not contract.inline_message_id and not (
-            contract.chat_id and contract.message_id
-        ):
+        if not contract.has_message:
             log.warning("Контракт %s не привязан к сообщению", contract.token)
             return False
         target: dict[str, object] = {"inline_message_id": contract.inline_message_id}
@@ -302,24 +421,12 @@ class App:
         signed = set(contract.signatures)
         remaining = [field.label for key, field in template.fields.items() if key not in signed]
         field = template.fields.get(field_key)
-        if contract.inline_message_id and contract.chat_key is None:
-            caption = ui.inline_progress_caption(
-                self.config,
-                template,
-                field.label if field else field_key,
-                ", ".join(remaining),
-                self.max_length_for(template),
-            )
-            markup = ui.inline_signed_markup(self.config, contract.token, template, signed)
-        else:
-            caption = self.config.text(
-                "guest.one_signed",
-                label=html.escape(field.label if field else field_key),
-                remaining=html.escape(", ".join(remaining)),
-            )
-            markup = ui.signed_buttons_markup(
-                self.config, contract.token, template, signed
-            )
+        caption = self.config.text(
+            "guest.one_signed",
+            label=html.escape(field.label if field else field_key),
+            remaining=html.escape(", ".join(remaining)),
+        )
+        markup = ui.signed_buttons_markup(self.config, contract.token, template, signed)
         return await self.edit_contract(contract, template, caption, markup)
 
     async def mark_expired(self, contract: Contract) -> None:
@@ -359,6 +466,7 @@ class App:
                 template,
                 signature_texts,
                 self_sign_note=note,
+                terms=contract.terms or None,
                 settings=self.settings.render,
             )
         except RenderError as exc:
@@ -381,13 +489,17 @@ class App:
             self_signed,
             note or "",
         )
-        if not contract.inline_message_id:
+        if not contract.has_message:
             log.warning("Контракт %s подписан, но сообщение уже недоступно", contract.token)
             self.store.drop(contract)
             return True
+        if contract.inline_message_id:
+            target: dict[str, object] = {"inline_message_id": contract.inline_message_id}
+        else:
+            target = {"chat_id": contract.chat_id, "message_id": contract.message_id}
         try:
             await self.bot.edit_message_media(
-                inline_message_id=contract.inline_message_id,
+                **target,
                 media=InputMediaPhoto(
                     media=file_id,
                     caption=caption,
@@ -422,16 +534,6 @@ class App:
         now = time.time()
         expired = self.store.expire_pending(now)
         touched = {pending.token for pending in expired}
-        for pending in expired:
-            contract = self.store.get(pending.token)
-            if contract is None or contract.chat_key is not None:
-                continue  # guest chats get their buttons back below
-            try:
-                await self.bot.send_message(
-                    pending.user_id, self.config.text("dm.prompt_expired")
-                )
-            except Exception:  # noqa: BLE001 - user may have blocked the bot
-                pass
         for token in touched:
             contract = self.store.get(token)
             if contract is None or contract.chat_key is None:

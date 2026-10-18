@@ -5,11 +5,12 @@ from aiogram.types import Update
 
 def test_dispatcher_subscribes_to_all_entry_points(app):
     used = app.dp.resolve_used_update_types()
-    assert "inline_query" in used
-    assert "chosen_inline_result" in used
     assert "guest_message" in used
     assert "callback_query" in used
     assert "message" in used
+    # Inline mode больше не используется: всё происходит в чате.
+    assert "inline_query" not in used
+    assert "chosen_inline_result" not in used
 
 
 def test_guest_update_parsing():
@@ -91,17 +92,16 @@ def test_tokens_are_url_safe(app):
     assert all(char in "0123456789abcdef" for char in token)
 
 
-def test_inline_payloads_fit_telegram_limits(app):
+def test_every_template_fits_callback_limit(app):
     from app import ui
     from app.store import new_token
 
     token = new_token()
     for template in app.templates():
-        markup = ui.inline_sign_markup(app.config, token, template)
-        for row in markup.inline_keyboard:
-            for button in row:
-                assert len(button.callback_data.encode()) <= 64
-        # deep link: https://t.me/<bot>?start=s_<token>_<field>
-        for field_key in template.fields:
-            payload = f"s_{token}_{field_key}"
-            assert len(payload) <= 64
+        for markup in (
+            ui.contract_markup(app.config, token, template),
+            ui.preview_markup(app.config, token, 0, len(app.templates())),
+        ):
+            for row in markup.inline_keyboard:
+                for button in row:
+                    assert len(button.callback_data.encode()) <= 64

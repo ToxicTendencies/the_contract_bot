@@ -5,7 +5,7 @@ import io
 import pytest
 from PIL import Image
 
-from app.store import STATE_SIGNED
+from app.store import STATE_OPEN, STATE_SIGNED
 
 
 class FakeTelegramBot:
@@ -158,23 +158,32 @@ async def test_cleanup_forgets_signed_contract_silently(app, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_stale_prompt_notifies_user(app, monkeypatch):
+async def test_stale_prompt_restores_chat_view(app, monkeypatch):
+    """Просроченная подпись возвращает кнопки в чат, без сообщений в личку."""
     contract = app.store.create(
-        template_key="classic", inline_message_id="inline-1", initiator_id=1
+        chat_key="g1", template_key="classic", initiator_id=1, initiator_name="A"
     )
+    contract.inline_message_id = "inline-1"
+    contract.state = STATE_OPEN
     app.store.set_pending(55, contract, "party1")
     app.store._pending[55].deadline -= app.store.pending_seconds + 1
 
-    async def fail(**kwargs):
-        raise AssertionError("сообщение в чате не должно редактироваться")
-
-    monkeypatch.setattr(app.bot, "edit_message_media", fail)
+    edits: list[dict] = []
     sent: list[tuple[int, str]] = []
+
+    async def edit_message_media(**kwargs):
+        edits.append(kwargs)
 
     async def send_message(chat_id, text):
         sent.append((chat_id, text))
 
-    app.bot.send_message = send_message
+    monkeypatch.setattr(app.bot, "edit_message_media", edit_message_media)
+    monkeypatch.setattr(app.bot, "send_message", send_message)
+    monkeypatch.setattr(app.storage, "file_id", lambda key: "file-id")
+
     await app.cleanup_once()
-    assert sent and sent[0][0] == 55
-    assert "истекло" in sent[0][1].lower() or "истёк" in sent[0][1].lower()
+
+    assert app.store.pending_for(55) is None
+    assert edits, "сообщение в чате должно вернуться к кнопкам"
+    assert "Нажми кнопку" in edits[-1]["media"].caption
+    assert sent == [], "в личку ничего писать не нужно"

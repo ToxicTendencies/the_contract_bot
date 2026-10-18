@@ -1,0 +1,15 @@
+services:
+  bot:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./config:/app/config:ro
+      - ./templates:/app/templates:ro
+      - ./assets:/app/assets:ro
+      - cache:/app/.cache
+    # Боту не нужен домен: он работает через long polling.
+    # ВАЖНО: запускай только один экземпляр — состояние контрактов живёт в RAM.
+
+volumes:
+  cache:

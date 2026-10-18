@@ -1,0 +1,101 @@
+# Бланки контрактов и координаты полей.
+#
+# box: [x, y, ширина, высота] — прямоугольник в пикселях на картинке.
+# Текст автоматически переносится, центрируется и уменьшается, чтобы влезть.
+# После правки запусти:  python generate_samples.py --debug-boxes
+#
+# Шрифты можно указывать алиасом из блока fonts или путём к .ttf/.otf.
+# Шрифт подписи задаётся в defaults.font и может переопределяться в поле.
+
+fonts:
+  handwriting: assets/fonts/Caveat-Variable.ttf
+  comic: assets/fonts/Neucha.ttf
+  serif: assets/fonts/PTSerif-Regular.ttf
+  serif_bold: assets/fonts/PTSerif-Bold.ttf
+  display: assets/fonts/Oswald-Variable.ttf
+  emoji: assets/fonts/NotoEmoji-Variable.ttf
+
+  # Comic Neue — свободная замена Comic Sans (кириллица есть).
+  comic_sans: assets/fonts/ComicNeue-Regular.ttf
+  # Настоящий Comic Sans MS проприетарный, в репозиторий не входит.
+  # Положи свой файл в assets/fonts/ComicSansMS.ttf и замени строку выше на:
+  # comic_sans: assets/fonts/ComicSansMS.ttf
+
+defaults:
+  font: handwriting
+  emoji_font: emoji
+  font_size: 58
+  color: "#1b2a4a"
+  align: center          # left | center | right
+  valign: middle         # top | middle | bottom
+  max_length: 32
+  max_lines: 2
+  min_font_scale: 0.6
+  line_spacing: 1.05
+
+templates:
+  classic:
+    file: templates/classic.png
+    title: "Классический договор"
+    description: "Строгий бланк · две подписи"
+    tags: ["классика", "строгий", "договор"]
+    fields:
+      party1:
+        label: "Сторона 1"
+        sample: "Иванов И.И."
+        box: [78, 1280, 500, 140]
+      party2:
+        label: "Сторона 2"
+        sample: "Петров П.П."
+        box: [662, 1280, 500, 140]
+    self_sign_note:
+      box: [78, 1488, 1084, 72]
+      font: comic
+      font_size: 32
+      color: "#a33a2e"
+      align: center
+
+  minimal:
+    file: templates/minimal.png
+    title: "Минималистичный"
+    description: "Лёгкий бланк · две подписи"
+    tags: ["минимализм", "лёгкий", "соглашение"]
+    fields:
+      party1:
+        label: "Сторона 1"
+        sample: "Анна ❤️"
+        box: [90, 1160, 480, 140]
+      party2:
+        label: "Сторона 2"
+        sample: "ООО «Рога и Копыта» 🐐"
+        box: [670, 1160, 480, 140]
+        font_size: 50
+    self_sign_note:
+      box: [90, 1360, 1060, 70]
+      font: comic
+      font_size: 30
+      color: "#b04a2f"
+      align: center
+
+  dark:
+    file: templates/dark.png
+    title: "Ночной контракт"
+    description: "Тёмный бланк · золото"
+    tags: ["тёмный", "ночной", "золото"]
+    fields:
+      party1:
+        label: "Сторона 1"
+        sample: "Иванов И.И."
+        box: [80, 1270, 500, 150]
+        color: "#f0e2c0"
+      party2:
+        label: "Сторона 2"
+        sample: "Петров П.П."
+        box: [660, 1270, 500, 150]
+        color: "#f0e2c0"
+    self_sign_note:
+      box: [80, 1480, 1080, 70]
+      font: comic
+      font_size: 32
+      color: "#d4a24c"
+      align: center

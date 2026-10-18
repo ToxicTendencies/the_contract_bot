@@ -1,0 +1,5 @@
+aiogram>=3.28,<4
+Pillow>=11,<14
+PyYAML>=6,<7
+python-dotenv>=1,<2
+regex>=2024.0

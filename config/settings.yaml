@@ -1,0 +1,36 @@
+# Общие настройки бота.
+# Секреты (BOT_TOKEN, OWNER_ID, STORAGE_CHAT_ID) лежат в .env, не здесь.
+
+contract:
+  # Сколько живёт неподписанный контракт с момента последнего действия.
+  ttl_minutes: 60
+  # Сколько ждём текст подписи после нажатия кнопки стороны.
+  pending_input_minutes: 10
+  # Предохранитель от утечки памяти: больше контрактов не держим.
+  max_active: 500
+  # Как часто фоновая задача чистит просроченное.
+  cleanup_interval_seconds: 30
+
+limits:
+  # Лимит по умолчанию, если в templates.yaml у поля не указан свой.
+  signature_max_length: 32
+  # Жёсткий потолок: выше не пустим даже если в бланке указано больше.
+  signature_hard_cap: 64
+  # Максимум строк по умолчанию.
+  max_lines: 2
+  # Минимальный кегль в долях от заданного.
+  min_font_scale: 0.6
+
+render:
+  # Качество JPEG для подписанной картинки.
+  jpeg_quality: 92
+  # Максимальная сторона фото при отправке в Telegram.
+  max_photo_side: 2560
+
+storage:
+  # Кэш file_id бланков. Пользовательских данных здесь нет.
+  cache_dir: .cache
+  file_ids_file: file_ids.json
+
+logging:
+  level: INFO

@@ -77,34 +77,55 @@ def with_terms(
 # ---------------------------------------------------------------------------
 
 
+def _column(buttons: list[InlineKeyboardButton]) -> list[list[InlineKeyboardButton]]:
+    """Каждая кнопка — на своей строке.
+
+    Telegram растягивает строку на всю ширину клавиатуры и делит её между
+    кнопками: две кнопки в строке — половинки, одна — вся ширина. Как только
+    число кнопок в строке меняется (превью → бланк → подписано), кнопки
+    «скачут» по ширине. Поэтому в сценарии контракта все строки — из одной
+    кнопки: ширина не меняется никогда.
+    """
+    return [[button] for button in buttons]
+
+
 def preview_markup(cfg: ConfigManager, token: str, index: int, total: int) -> InlineKeyboardMarkup:
     prev_index = (index - 1) % total
     next_index = (index + 1) % total
-    row = [
+    buttons = [
         InlineKeyboardButton(text=_q(cfg, "buttons.prev"), callback_data=f"pv:{token}:{prev_index}"),
         InlineKeyboardButton(text=_q(cfg, "buttons.pick"), callback_data=f"pk:{token}:{index}"),
         InlineKeyboardButton(text=_q(cfg, "buttons.next"), callback_data=f"pn:{token}:{next_index}"),
     ]
-    return InlineKeyboardMarkup(inline_keyboard=[row])
+    return InlineKeyboardMarkup(inline_keyboard=_column(buttons))
 
 
 def contract_markup(cfg: ConfigManager, token: str, template: TemplateConfig) -> InlineKeyboardMarkup:
-    rows: list[list[InlineKeyboardButton]] = []
-    row: list[InlineKeyboardButton] = []
-    for field in template.fields.values():
-        row.append(
-            InlineKeyboardButton(
-                text=_sign_button_text(cfg, field.label),
-                callback_data=f"sg:{token}:{template.key}:{field.key}",
-            )
+    buttons = [
+        InlineKeyboardButton(
+            text=_sign_button_text(cfg, field.label),
+            callback_data=f"sg:{token}:{template.key}:{field.key}",
         )
-        if len(row) == 2:
-            rows.append(row)
-            row = []
-    if row:
-        rows.append(row)
-    rows.append([InlineKeyboardButton(text=_q(cfg, "buttons.cancel"), callback_data=f"cx:{token}")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+        for field in template.fields.values()
+    ]
+    buttons.append(
+        InlineKeyboardButton(text=_q(cfg, "buttons.cancel"), callback_data=f"cx:{token}")
+    )
+    return InlineKeyboardMarkup(inline_keyboard=_column(buttons))
+
+
+def terms_prompt_markup(cfg: ConfigManager, token: str) -> InlineKeyboardMarkup:
+    """Пока условий нет, их может предложить любой — кнопка видна сразу."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=_column(
+            [
+                InlineKeyboardButton(
+                    text=_trim(_q(cfg, "buttons.propose_terms"), 60),
+                    callback_data=f"ds:{token}",
+                )
+            ]
+        )
+    )
 
 
 def signed_buttons_markup(
@@ -115,7 +136,7 @@ def signed_buttons_markup(
     *,
     dispute: bool = False,
 ) -> InlineKeyboardMarkup:
-    rows: list[list[InlineKeyboardButton]] = []
+    buttons: list[InlineKeyboardButton] = []
     for field in template.fields.values():
         if field.key in signed:
             label = _trim(_q(cfg, "buttons.signed", label=field.label))
@@ -123,27 +144,26 @@ def signed_buttons_markup(
         else:
             label = _sign_button_text(cfg, field.label)
             callback_data = f"sg:{token}:{template.key}:{field.key}"
-        rows.append([InlineKeyboardButton(text=label, callback_data=callback_data)])
+        buttons.append(InlineKeyboardButton(text=label, callback_data=callback_data))
     if dispute:
-        rows.append(
-            [
-                InlineKeyboardButton(
-                    text=_trim(_q(cfg, "buttons.dispute"), 60),
-                    callback_data=f"ds:{token}",
-                )
-            ]
+        buttons.append(
+            InlineKeyboardButton(
+                text=_trim(_q(cfg, "buttons.dispute"), 60),
+                callback_data=f"ds:{token}",
+            )
         )
-    rows.append([InlineKeyboardButton(text=_q(cfg, "buttons.cancel"), callback_data=f"cx:{token}")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+    buttons.append(
+        InlineKeyboardButton(text=_q(cfg, "buttons.cancel"), callback_data=f"cx:{token}")
+    )
+    return InlineKeyboardMarkup(inline_keyboard=_column(buttons))
 
 
 def dispute_markup(cfg: ConfigManager, token: str) -> InlineKeyboardMarkup:
     """Пока человек печатает новую редакцию, подписывать нечего."""
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text=_q(cfg, "buttons.cancel"), callback_data=f"cx:{token}")]
-        ]
-    )
+    buttons = [
+        InlineKeyboardButton(text=_q(cfg, "buttons.cancel"), callback_data=f"cx:{token}")
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=_column(buttons))
 
 
 def empty_markup() -> InlineKeyboardMarkup:

@@ -1027,6 +1027,7 @@ def required_text_keys() -> Iterable[str]:
         "buttons.sign",
         "buttons.signed",
         "buttons.dispute",
+        "buttons.propose_terms",
         "buttons.cancel",
         "callback.expired",
         "callback.done",

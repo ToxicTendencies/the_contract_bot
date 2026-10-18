@@ -309,7 +309,7 @@ class App:
                 contract,
                 template,
                 ui.terms_prompt(self.config, template, template.terms_max_length),
-                None,
+                ui.terms_prompt_markup(self.config, contract.token),
             )
         else:
             templates = self.templates()
@@ -419,7 +419,7 @@ class App:
             contract,
             template,
             ui.terms_prompt(self.config, template, template.terms_max_length),
-            None,
+            ui.terms_prompt_markup(self.config, contract.token),
         )
 
     async def edit_terms_prompt(
@@ -433,7 +433,7 @@ class App:
             contract,
             template,
             ui.terms_prompt(self.config, template, template.terms_max_length),
-            None,
+            ui.terms_prompt_markup(self.config, contract.token),
         )
 
     async def show_terms_contract(

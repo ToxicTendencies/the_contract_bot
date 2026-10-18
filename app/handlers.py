@@ -903,9 +903,15 @@ async def _handle_dispute(app: "App", query: CallbackQuery, token: str) -> None:
     if contract.state == STATE_SIGNED:
         await query.answer(app.config.text("callback.done"))
         return
+
     if not contract.terms:
-        # Условий ещё нет: сначала их надо прислать.
-        await query.answer(app.config.text("callback.terms_first"))
+        # Условий ещё нет: кнопка значит «предложить свои первым».
+        # Кто нажал — тот и пишет редакцию, даже если бота вызвал другой.
+        contract.terms_user_id = query.from_user.id
+        contract.touch()
+        ok = await app.edit_terms_prompt(contract, template)
+        app.note(f"terms claimed token={contract.token} user={query.from_user.id}")
+        await query.answer("" if ok else app.config.text("errors.generic"))
         return
 
     editors = app.store.pending_terms_for_contract(contract.token)

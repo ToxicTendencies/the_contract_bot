@@ -7,7 +7,7 @@ import html
 import logging
 import secrets
 import time
-from collections import deque
+from collections import OrderedDict, deque
 from typing import Iterable
 
 from aiogram import Bot, Dispatcher
@@ -40,6 +40,9 @@ log = logging.getLogger(__name__)
 
 
 class App:
+    # Сколько разных дат бланка держим в памяти (file_id, не картинки).
+    DATED_CACHE_LIMIT = 64
+
     def __init__(self, config: ConfigManager):
         self.config = config
         self.settings = config.settings
@@ -62,7 +65,9 @@ class App:
         self._warmup_lock = asyncio.Lock()
         # Готовые картинки бланков с датой: ключ «бланк|дата» -> file_id.
         # Живут в RAM и переживают только текущий процесс — так и задумано.
-        self._dated_files: dict[str, str] = {}
+        # LRU: дат немного, но менять их может каждый, так что потолок нужен.
+        self._dated_files: OrderedDict[str, str] = OrderedDict()
+        self._dated_lock = asyncio.Lock()
         # Короткая история событий: /debug показывает её владельцу, когда
         # «в чате что-то не так», а доступа к логам сервера нет.
         self.events: deque[str] = deque(maxlen=120)
@@ -165,7 +170,7 @@ class App:
                 f"tmpl={contract.template_key} inline={inline} "
                 f"msg={contract.message_id or '-'} signed={signed} pending={pending} "
                 f"terms={revisions} author={contract.terms_author_id or '-'} "
-                f"date={contract.date_text or 'auto'}"
+                f"date={html.escape(contract.date_text or 'auto')}"
             )
         return lines
 
@@ -205,11 +210,19 @@ class App:
         """Дата на бланке: ручная, если её вписали, иначе сегодняшняя."""
         return contract.date_text or default_date(self.settings.dates)
 
+    def date_button_text(self, contract: Contract, template: TemplateConfig) -> str:
+        """Подпись на кнопке даты; пусто — кнопки не будет вовсе."""
+        return self.contract_date(contract) if template.uses_dates else ""
+
     def date_max_length(self, template: TemplateConfig) -> int:
-        dates = template.dates
-        if dates is None:
-            return min(40, self.settings.limits.signature_hard_cap)
-        return min(dates.style.max_length, self.settings.limits.signature_hard_cap)
+        rule = template.date_rule
+        return rule.style.max_length if rule is not None else 40
+
+    def _remember_dated(self, key: str, file_id: str) -> None:
+        self._dated_files[key] = file_id
+        self._dated_files.move_to_end(key)
+        while len(self._dated_files) > self.DATED_CACHE_LIMIT:
+            self._dated_files.popitem(last=False)
 
     async def blank_file_id(
         self, contract: Contract, template: TemplateConfig
@@ -219,39 +232,47 @@ class App:
         Готовые файлы бланков лежат в storage без даты, поэтому для превью
         и карточек рисуем дату и один раз загружаем картинку. Кэш — по паре
         «бланк + дата»: автоматическая дата переиспользуется всеми, ручная
-        живёт своей записью.
+        живёт своей записью. Без даты (свой бланк без блока dates) картинка
+        тоже грузится один раз.
         """
         if contract.blank_file_id:
             return contract.blank_file_id
-        base = self.storage.file_id(template.key)
-        if not template.has_dates and not template.is_custom:
-            return base
 
-        date_text = self.contract_date(contract)
+        if not template.uses_dates and not template.is_custom:
+            return self.storage.file_id(template.key)
+
+        date_text = self.contract_date(contract) if template.uses_dates else ""
         cache_key = f"{template.key}|{date_text}"
         cached = self._dated_files.get(cache_key)
         if cached:
+            self._dated_files.move_to_end(cache_key)
             return cached
-        try:
-            data = render_contract(
-                template,
-                {},
-                date=date_text,
-                settings=self.settings.render,
-            )
-            file_id = await self.storage.preview_image(
-                self.bot,
-                data,
-                f"Бланк: {html.escape(template.title)}",
-                key=template.key,
-            )
-        except Exception:  # noqa: BLE001
-            log.exception("Не удалось нарисовать бланк %s с датой", template.key)
-            return base
-        if len(self._dated_files) >= 120:
-            self._dated_files.clear()
-        self._dated_files[cache_key] = file_id
-        return file_id
+
+        # Два чата могут попросить один и тот же бланк одновременно:
+        # без замка он уедет в storage дважды.
+        async with self._dated_lock:
+            cached = self._dated_files.get(cache_key)
+            if cached:
+                self._dated_files.move_to_end(cache_key)
+                return cached
+            try:
+                data = render_contract(
+                    template,
+                    {},
+                    date=date_text or None,
+                    settings=self.settings.render,
+                )
+                file_id = await self.storage.preview_image(
+                    self.bot,
+                    data,
+                    f"Бланк: {html.escape(template.title)}",
+                    key=template.key,
+                )
+            except Exception:  # noqa: BLE001
+                log.exception("Не удалось нарисовать бланк %s с датой", template.key)
+                return self.storage.file_id(template.key)
+            self._remember_dated(cache_key, file_id)
+            return file_id
 
     def max_length_for(self, template: TemplateConfig) -> int:
         cap = self.settings.limits.signature_hard_cap
@@ -370,7 +391,7 @@ class App:
                 template,
                 ui.terms_prompt(self.config, template, template.terms_max_length),
                 ui.terms_prompt_markup(
-                    self.config, contract.token, date=self.contract_date(contract)
+                    self.config, contract.token, date=self.date_button_text(contract, template)
                 ),
             )
         else:
@@ -390,7 +411,7 @@ class App:
                     contract.token,
                     index,
                     len(templates),
-                    date=self.contract_date(contract),
+                    date=self.date_button_text(contract, shown),
                 ),
             )
 
@@ -456,7 +477,7 @@ class App:
             template,
             set(contract.signatures),
             dispute=self.can_dispute(contract, template),
-            date=self.contract_date(contract),
+            date=self.date_button_text(contract, template),
         )
 
     async def send_preview(
@@ -476,7 +497,7 @@ class App:
                 contract.token,
                 index,
                 total,
-                date=self.contract_date(contract),
+                date=self.date_button_text(contract, template),
             ),
         )
 
@@ -494,7 +515,7 @@ class App:
             template,
             ui.terms_prompt(self.config, template, template.terms_max_length),
             ui.terms_prompt_markup(
-                self.config, contract.token, date=self.contract_date(contract)
+                self.config, contract.token, date=self.date_button_text(contract, template)
             ),
         )
 
@@ -510,7 +531,7 @@ class App:
             template,
             ui.terms_prompt(self.config, template, template.terms_max_length),
             ui.terms_prompt_markup(
-                self.config, contract.token, date=self.contract_date(contract)
+                self.config, contract.token, date=self.date_button_text(contract, template)
             ),
         )
 
@@ -603,7 +624,7 @@ class App:
                 contract.token,
                 index,
                 total,
-                date=self.contract_date(contract),
+                date=self.date_button_text(contract, template),
             ),
         )
 
@@ -619,7 +640,7 @@ class App:
                 self.config,
                 contract.token,
                 template,
-                date=self.contract_date(contract),
+                date=self.date_button_text(contract, template),
             ),
         )
 

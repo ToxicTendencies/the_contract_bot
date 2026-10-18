@@ -19,6 +19,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable
+from zoneinfo import ZoneInfo
 
 import yaml
 from dotenv import load_dotenv
@@ -273,8 +274,6 @@ def load_settings(
 
     timezone = str(dates_raw.get("timezone", "Europe/Moscow")).strip() or "Europe/Moscow"
     try:
-        from zoneinfo import ZoneInfo
-
         ZoneInfo(timezone)
     except Exception as exc:  # noqa: BLE001 - ZoneInfo raises several types
         raise ConfigError(f"dates.timezone: неизвестный часовой пояс {timezone!r}") from exc
@@ -442,8 +441,23 @@ class TemplateConfig:
     canvas: tuple[int, int] = (1240, 1754)
 
     @property
-    def has_dates(self) -> bool:
-        return self.dates is not None
+    def date_blocks(self) -> tuple[DateConfig, ...]:
+        """Все блоки даты: основной и необязательные подписи под полями."""
+        blocks: list[DateConfig] = []
+        if self.dates is not None:
+            blocks.append(self.dates)
+        blocks.extend(field.date for field in self.fields.values() if field.date is not None)
+        return tuple(blocks)
+
+    @property
+    def uses_dates(self) -> bool:
+        return bool(self.date_blocks)
+
+    @property
+    def date_rule(self) -> DateConfig | None:
+        """Первый блок даты — для проверки ручного ввода."""
+        blocks = self.date_blocks
+        return blocks[0] if blocks else None
 
     @property
     def is_custom(self) -> bool:
@@ -788,50 +802,37 @@ def _image_size(path: Path) -> tuple[int, int]:
         raise ConfigError(f"Не удалось открыть картинку {path}: {exc}") from exc
 
 
-def load_templates(
-    path: Path = CONFIG_DIR / "templates.yaml",
-    limits: Limits | None = None,
-    strict: bool = False,
-    warnings: list[str] | None = None,
-    extra_paths: Iterable[Path] = (),
-) -> TemplatesConfig:
-    """Load templates.  In non-strict mode broken templates are skipped.
+def _load_templates_file(
+    path: Path,
+    limits: Limits,
+    strict: bool,
+    warnings: list[str],
+    *,
+    require_any: bool = True,
+    base_fonts: dict[str, Path] | None = None,
+    base_defaults: dict[str, Any] | None = None,
+) -> tuple[TemplatesConfig, dict[str, Any]]:
+    """Разобрать один файл бланков: свои fonts и defaults у каждого файла.
 
-    ``extra_paths`` — дополнительные файлы бланков (например,
-    ``custom_templates.yaml`` с бланками, собранными пользователем).
-    Их шрифты и настройки по умолчанию дополняют основной файл.
+    Так `defaults` из `custom_templates.yaml` не меняют стандартные бланки:
+    они действуют только на бланки своего файла.
     """
-    limits = limits or Limits()
     raw = _read_yaml(path)
-    warnings = warnings if warnings is not None else []
-
-    merged = dict(raw)
-    merged_templates: dict[str, Any] = dict(_mapping(raw.get("templates"), "templates"))
-    merged_fonts: dict[str, Any] = dict(_mapping(raw.get("fonts"), "fonts"))
-    merged_defaults: dict[str, Any] = dict(_mapping(raw.get("defaults"), "defaults"))
-    for extra in extra_paths:
-        if extra is None or not Path(extra).exists():
-            continue
-        extra_raw = _read_yaml(Path(extra))
-        merged_fonts.update(_mapping(extra_raw.get("fonts"), f"{extra}.fonts"))
-        merged_defaults.update(_mapping(extra_raw.get("defaults"), f"{extra}.defaults"))
-        merged_templates.update(
-            _mapping(extra_raw.get("templates"), f"{extra}.templates")
-        )
-    merged["fonts"] = merged_fonts
-    merged["defaults"] = merged_defaults
-    merged["templates"] = merged_templates
-    raw = merged
 
     fonts_raw = _mapping(raw.get("fonts"), "fonts")
-    fonts: dict[str, Path] = {
-        str(alias): _resolve_path(str(value)) for alias, value in fonts_raw.items()
-    }
+    fonts: dict[str, Path] = dict(base_fonts or {})
+    fonts.update(
+        {str(alias): _resolve_path(str(value)) for alias, value in fonts_raw.items()}
+    )
 
-    defaults = _mapping(raw.get("defaults"), "defaults")
+    defaults: dict[str, Any] = dict(base_defaults or {})
+    defaults.update(_mapping(raw.get("defaults"), "defaults"))
     templates_raw = _mapping(raw.get("templates"), "templates")
     if not templates_raw:
-        raise ConfigError(f"В {path} нет ни одного бланка в templates")
+        if require_any:
+            raise ConfigError(f"В {path} нет ни одного бланка в templates")
+        warnings.append(f"{path}: нет ни одного бланка в templates")
+        return TemplatesConfig(items={}, fonts=fonts, path=path), defaults
 
     items: list[TemplateConfig] = []
     for key, template_raw in templates_raw.items():
@@ -894,6 +895,11 @@ def load_templates(
                     raise ConfigError(
                         f"templates.{key}.canvas: слишком маленький холст {canvas}"
                     )
+            except ConfigError as exc:
+                if strict:
+                    raise
+                warnings.append(str(exc))
+                canvas = (1240, 1754)
             except (TypeError, ValueError) as exc:
                 if strict:
                     raise ConfigError(
@@ -1130,11 +1136,68 @@ def load_templates(
         )
 
     if not items:
-        raise ConfigError(f"В {path} не осталось ни одного рабочего бланка")
+        if require_any:
+            raise ConfigError(f"В {path} не осталось ни одного рабочего бланка")
+        return TemplatesConfig(items={}, fonts=fonts, path=path), defaults
 
     items.sort(key=lambda item: (item.sort, list(templates_raw).index(item.key)))
+    return (
+        TemplatesConfig(
+            items={item.key: item for item in items},
+            fonts=fonts,
+            path=path,
+        ),
+        defaults,
+    )
+
+
+def load_templates(
+    path: Path = CONFIG_DIR / "templates.yaml",
+    limits: Limits | None = None,
+    strict: bool = False,
+    warnings: list[str] | None = None,
+    extra_paths: Iterable[Path] = (),
+) -> TemplatesConfig:
+    """Load templates.  In non-strict mode broken templates are skipped.
+
+    ``extra_paths`` — дополнительные файлы бланков (например,
+    ``custom_templates.yaml`` с бланками, собранными пользователем).
+    Каждый файл приносит свои шрифты и defaults; бланк с тем же ключом
+    из дополнительного файла заменяет основной.
+    """
+    limits = limits or Limits()
+    warnings = warnings if warnings is not None else []
+
+    main, base_defaults = _load_templates_file(path, limits, strict, warnings)
+    items: dict[str, TemplateConfig] = dict(main.items)
+    fonts: dict[str, Path] = dict(main.fonts)
+
+    for extra in extra_paths:
+        extra_path = Path(extra)
+        if not extra_path.exists():
+            continue
+        extra_config, _ = _load_templates_file(
+            extra_path,
+            limits,
+            strict,
+            warnings,
+            require_any=False,
+            # Свой файл видит шрифты и defaults основного, но свои значения
+            # перекрывают их только для своих бланков.
+            base_fonts=fonts,
+            base_defaults=base_defaults,
+        )
+        fonts.update(extra_config.fonts)
+        # dict сохраняет позицию первого вхождения: переопределённый бланк
+        # остаётся на своём месте в карусели.
+        items.update(extra_config.items)
+
+    if not items:
+        raise ConfigError(f"В {path} не осталось ни одного рабочего бланка")
+
+    ordered = sorted(items.values(), key=lambda item: item.sort)
     return TemplatesConfig(
-        items={item.key: item for item in items},
+        items={item.key: item for item in ordered},
         fonts=fonts,
         path=path,
     )

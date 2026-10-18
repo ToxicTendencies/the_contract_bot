@@ -1529,3 +1529,27 @@ async def test_private_chat_date_edit(wired):
     await handle_chat_message(app, reply)
     assert contract.date_text == "03.03.2030"
     assert contract.date_user_id == boris.id
+
+
+@pytest.mark.asyncio
+async def test_dated_blank_is_uploaded_once_per_date(wired):
+    """Кэш «бланк + дата»: две одинаковые даты — одна загрузка в storage."""
+    app, _bot, storage = wired
+    calls: list[str] = []
+    original = storage.preview_image
+
+    async def preview_image(bot, data, caption, *, key="", filename="blank.jpg"):
+        calls.append(key)
+        return await original(bot, data, caption, key=key, filename=filename)
+
+    storage.preview_image = preview_image
+    template = app.config.templates.get("classic")
+
+    first = app.store.create(template_key="classic", date_text="01.02.2027")
+    second = app.store.create(template_key="classic", date_text="01.02.2027")
+    other = app.store.create(template_key="classic", date_text="02.02.2027")
+
+    assert await app.blank_file_id(first, template) == "file-classic"
+    assert await app.blank_file_id(second, template) == "file-classic"
+    assert await app.blank_file_id(other, template) == "file-classic"
+    assert calls == ["classic", "classic"]

@@ -69,8 +69,6 @@ class PendingDate:
     token: str
     user_id: int
     chat_key: str | None = None
-    # Куда вернуть карточку, если человек передумает или пришлёт дату.
-    return_state: str = ""
     deadline: float = 0.0
 
     def expired(self, now: float | None = None) -> bool:
@@ -583,9 +581,7 @@ class ContractStore:
                 continue
             self._terms_pending.pop(key, None)
 
-    def set_pending_date(
-        self, user_id: int, contract: Contract, *, return_state: str = ""
-    ) -> PendingDate:
+    def set_pending_date(self, user_id: int, contract: Contract) -> PendingDate:
         """Ждём ручную дату.  Подпись и условия при этом отменяются."""
         self.clear_pending(user_id, contract.token)
         self.clear_pending_terms(user_id, contract.token)
@@ -593,7 +589,6 @@ class ContractStore:
             token=contract.token,
             user_id=user_id,
             chat_key=contract.chat_key,
-            return_state=return_state,
             deadline=time.time() + self.pending_seconds,
         )
         self._date_pending[(user_id, contract.token)] = pending

@@ -9,6 +9,7 @@ from app.config import Box, load_templates
 from app.render import (
     build_canvas,
     count_graphemes,
+    debug_image,
     default_date,
     format_date,
     layout_text,
@@ -195,10 +196,9 @@ templates:
 
 def test_validate_date(config):
     dates = config.templates.get("classic").dates
-    limits = config.settings.limits
-    assert validate_date("18.10.2026", dates, limits).ok
-    assert validate_date("   ", dates, limits).error == "empty"
-    assert validate_date("1" * 80, dates, limits).error == "too_long"
+    assert validate_date("18.10.2026", dates).ok
+    assert validate_date("   ", dates).error == "empty"
+    assert validate_date("1" * 80, dates).error == "too_long"
 
 
 def test_render_draws_date(config):
@@ -250,4 +250,18 @@ def test_render_custom_template_with_date(tmp_path):
     )
     image = Image.open(io.BytesIO(data))
     assert image.format == "JPEG"
+    assert image.size == (1000, 1400)
+
+
+def test_build_canvas_returns_isolated_copy(tmp_path):
+    template = _custom_template(tmp_path)
+    first = build_canvas(template)
+    first.paste((1, 2, 3), (0, 0, 20, 20))
+    second = build_canvas(template)
+    assert second.getpixel((5, 5)) != (1, 2, 3)
+
+
+def test_debug_image_works_for_custom_template(tmp_path):
+    template = _custom_template(tmp_path)
+    image = debug_image(template, draw_samples=False)
     assert image.size == (1000, 1400)

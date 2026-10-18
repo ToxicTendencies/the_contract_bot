@@ -3,3 +3,6 @@ Pillow>=11,<14
 PyYAML>=6,<7
 python-dotenv>=1,<2
 regex>=2024.0
+# IANA-база часовых поясов: на Windows и в slim-образах без /usr/share/zoneinfo
+# без неё ZoneInfo("Europe/Moscow") падает.
+tzdata>=2024.1

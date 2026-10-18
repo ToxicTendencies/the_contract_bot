@@ -326,3 +326,20 @@ async def test_dm_debug_owner_only(app):
     assert owner.answers
     assert "Отладка" in owner.answers[0]
     assert "Последние события" in owner.answers[0]
+
+
+@pytest.mark.asyncio
+async def test_dm_debug_escapes_manual_date(app):
+    from app.handlers import handle_dm
+
+    contract = app.store.create(
+        template_key=app.templates()[0].key,
+        chat_key="g-100500",
+        date_text="<b>1</b>",
+    )
+    owner = FakeDM("/debug", user_id=app.settings.owner_id)
+    await handle_dm(app, owner)
+    report = owner.answers[0]
+    assert "<b>1</b>" not in report
+    assert "&lt;b&gt;1&lt;/b&gt;" in report
+    assert contract.token in report

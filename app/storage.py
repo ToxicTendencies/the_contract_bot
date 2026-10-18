@@ -87,7 +87,9 @@ class TemplateStorage:
 
     def file_id(self, template_key: str) -> str | None:
         template = self.config.templates.get(template_key)
-        if template is None:
+        if template is None or template.file is None:
+            # Бланк собирается на лету: его нельзя загрузить как файл,
+            # картинка рендерится и отправляется в storage по требованию.
             return None
         entry = self._cache.get(template_key)
         if entry is None:
@@ -98,6 +100,10 @@ class TemplateStorage:
         return entry.file_id
 
     def is_ready(self, template_key: str) -> bool:
+        template = self.config.templates.get(template_key)
+        if template is not None and template.is_custom:
+            # Собранный бланк готов, если у него есть фон.
+            return template.background is not None
         return self.file_id(template_key) is not None
 
     def forget(self, template_key: str) -> None:
@@ -115,7 +121,13 @@ class TemplateStorage:
                 ready += 1
                 continue
             template = templates.get(key)
-            if template is None or not template.file.exists():
+            if template is None:
+                continue
+            if template.file is None:
+                # Свой бланк из фона и рамки: он не грузится как файл.
+                ready += 1
+                continue
+            if not template.file.exists():
                 continue
             try:
                 message = await bot.send_photo(
@@ -135,6 +147,22 @@ class TemplateStorage:
             ready += 1
         self._save()
         return ready, len(templates)
+
+    async def preview_image(
+        self,
+        bot: Bot,
+        data: bytes,
+        caption: str,
+        *,
+        key: str = "",
+        filename: str = "blank.jpg",
+    ) -> str:
+        """Картинка бланка с датой для превью и обычных карточек.
+
+        Отдельный метод, чтобы тестовая заглушка хранилища могла вернуть
+        готовый ``file_id`` без реальной загрузки.
+        """
+        return await self.upload_image(bot, data, caption, filename=filename)
 
     async def upload_image(
         self, bot: Bot, data: bytes, caption: str, *, filename: str = "contract.jpg"

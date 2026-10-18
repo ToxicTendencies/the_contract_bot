@@ -1,19 +1,23 @@
 from __future__ import annotations
 
 import io
+from pathlib import Path
 
-from PIL import Image
+from PIL import Image, ImageChops
 
-from app.config import Box
+from app.config import Box, load_templates
 from app.render import (
+    build_canvas,
     count_graphemes,
+    default_date,
+    format_date,
     layout_text,
     normalize_text,
     render_contract,
+    validate_date,
     validate_signature,
     validate_terms,
 )
-from app.config import load_templates
 
 
 def test_grapheme_counting():
@@ -144,3 +148,106 @@ def test_terms_are_drawn_on_the_blank(config):
     assert without != with_terms
     image = Image.open(io.BytesIO(with_terms))
     assert image.size == (1240, 1754)
+
+
+# ---------------------------------------------------------------------------
+# dates, background and frame
+# ---------------------------------------------------------------------------
+
+
+def _custom_template(tmp_path):
+    background = Path(__file__).resolve().parent.parent / "templates" / "classic.png"
+    source = tmp_path / "custom.yaml"
+    source.write_text(
+        f"""
+fonts:
+  serif: {Path(__file__).resolve().parent.parent / "assets/fonts/PTSerif-Regular.ttf"}
+
+templates:
+  my_blank:
+    title: "Мой бланк"
+    background:
+      image: {background}
+      fit: cover
+    frame:
+      color: "#334455"
+      width: 6
+      inset: 30
+    canvas: [1000, 1400]
+    dates:
+      box: [560, 40, 360, 60]
+      font_size: 26
+      align: right
+      format: "Дата: {{date}}"
+    fields:
+      party1:
+        label: "Сторона 1"
+        box: [80, 1000, 380, 120]
+      party2:
+        label: "Сторона 2"
+        box: [540, 1000, 380, 120]
+""",
+        encoding="utf-8",
+    )
+    templates = load_templates(extra_paths=[source], strict=True)
+    return templates.get("my_blank")
+
+
+def test_validate_date(config):
+    dates = config.templates.get("classic").dates
+    limits = config.settings.limits
+    assert validate_date("18.10.2026", dates, limits).ok
+    assert validate_date("   ", dates, limits).error == "empty"
+    assert validate_date("1" * 80, dates, limits).error == "too_long"
+
+
+def test_render_draws_date(config):
+    template = config.templates.get("classic")
+    plain = Image.open(
+        io.BytesIO(render_contract(template, {}, settings=config.settings.render))
+    )
+    dated = Image.open(
+        io.BytesIO(
+            render_contract(template, {}, date="01.02.2027", settings=config.settings.render)
+        )
+    )
+    box = template.dates.box
+    region = (box.x, box.y, box.right, box.bottom)
+    difference = ImageChops.difference(plain.crop(region), dated.crop(region))
+    assert difference.getbbox() is not None
+
+    manual = Image.open(
+        io.BytesIO(
+            render_contract(template, {}, date="31.12.2030", settings=config.settings.render)
+        )
+    )
+    assert manual.tobytes() != dated.tobytes()
+
+
+def test_default_date_uses_settings(config):
+    value = default_date(config.settings.dates)
+    assert len(value) == len("18.10.2026")
+    assert format_date(config.templates.get("classic").dates, value) == f"Дата: {value}"
+
+
+def test_custom_canvas_uses_background_and_frame(tmp_path):
+    template = _custom_template(tmp_path)
+    assert template is not None
+    image = build_canvas(template)
+    assert image.size == (1000, 1400)
+    # Рамка нарисована поверх фона.
+    assert image.getpixel((30, 700))[:3] == (0x33, 0x44, 0x55)
+    # Фон вписан в холст, а не остался белым.
+    assert image.getpixel((500, 700)) != (255, 255, 255)
+
+
+def test_render_custom_template_with_date(tmp_path):
+    template = _custom_template(tmp_path)
+    data = render_contract(
+        template,
+        {"party1": "Аня", "party2": "Боря"},
+        date="01.02.2027",
+    )
+    image = Image.open(io.BytesIO(data))
+    assert image.format == "JPEG"
+    assert image.size == (1000, 1400)

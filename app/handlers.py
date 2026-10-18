@@ -27,12 +27,14 @@ from aiogram.types import CallbackQuery, Message, User
 
 from . import ui
 from .config import TemplateConfig
-from .render import validate_signature, validate_terms
+from .render import default_date, validate_date, validate_signature, validate_terms
 from .store import (
+    STATE_OPEN,
     STATE_PREVIEW,
     STATE_SIGNED,
     STATE_TERMS,
     Contract,
+    PendingDate,
     PendingSignature,
     PendingTerms,
     chat_key,
@@ -388,6 +390,112 @@ async def handle_terms_text(
     await say("\n\n".join([headline, ui.terms_quote(check.text), tail]))
 
 
+async def handle_date_text(
+    app: "App",
+    message: Message,
+    user: User,
+    text: str,
+    say: Say,
+    contract: Contract,
+    pending: PendingDate,
+    *,
+    ignore_chat: bool = False,
+) -> None:
+    """Вписать дату вручную или вернуть автоматическую словом «авто»."""
+    template = app.template_or_first(contract.template_key)
+    if template is None:
+        app.store.clear_pending_date(user.id, contract.token)
+        await say(app.config.text("guest.contract_expired", bot=app.bot_username))
+        return
+    if template.dates is None:
+        app.store.clear_pending_date(user.id, contract.token)
+        await say(app.config.text("callback.no_dates"))
+        return
+    if contract.state == STATE_SIGNED:
+        app.store.clear_pending_date(user.id, contract.token)
+        await say(app.config.text("callback.done"))
+        return
+
+    key = _chat_key(message)
+    if contract.chat_key is not None and contract.chat_key != key and not ignore_chat:
+        app.note(
+            f"date rejected: chat {key} != contract {contract.chat_key} "
+            f"user={user.id} token={contract.token}"
+        )
+        return
+
+    value = text.strip()
+    auto = value.lower() in {"авто", "auto", "сегодня"}
+    if auto:
+        contract.date_text = default_date(app.settings.dates)
+        contract.date_auto = True
+        contract.date_user_id = 0
+        message_text = app.config.text("guest.date_auto", date=contract.date_text)
+    else:
+        check = validate_date(value, template.dates, app.settings.limits)
+        if not check.ok:
+            error = {
+                "empty": "guest.date_empty",
+                "too_long": "guest.date_too_long",
+                "does_not_fit": "guest.date_does_not_fit",
+            }.get(check.error or "", "errors.generic")
+            await say(app.config.text(error, length=check.length, max_length=check.max_length))
+            return
+        contract.date_text = check.text
+        contract.date_auto = False
+        contract.date_user_id = user.id
+        message_text = app.config.text(
+            "guest.date_set", date=html.escape(contract.date_text or "")
+        )
+
+    contract.touch()
+    app.store.clear_pending_date(user.id, contract.token)
+    # Условия уже напечатаны на картинке — перерисуем их с новой датой.
+    if template.terms is not None and contract.terms:
+        contract.blank_file_id = None
+        ok = await app.show_terms_contract(contract, template)
+    elif contract.state == STATE_PREVIEW:
+        ok = await app.show_preview_page(contract, contract.page)
+    elif contract.state == STATE_TERMS and template.terms is not None:
+        ok = await app.edit_terms_prompt(contract, template)
+    else:
+        contract.state = STATE_OPEN
+        ok = await app.edit_contract(
+            contract,
+            template,
+            app.contract_caption(contract, template),
+            app.signed_markup(contract, template),
+        )
+    if not ok:
+        message_text += "\n" + app.config.text("errors.generic")
+    app.note(f"date token={contract.token} user={user.id} auto={auto} value={contract.date_text!r}")
+    await say(message_text)
+
+
+def _date_pending_for(
+    app: "App",
+    user: User,
+    message: Message,
+    key: str,
+    target: Contract | None,
+) -> tuple[PendingDate | None, bool]:
+    """Ожидание ручной даты: по бланку, чату или единственное в личке."""
+    if target is not None:
+        pending = app.store.pending_date_for(user.id, token=target.token)
+        if pending is not None:
+            return pending, False
+    pending = app.store.pending_date_for(user.id, key)
+    if pending is not None:
+        return pending, False
+    if _is_private(message):
+        candidate = app.store.unique_pending_date(user.id)
+        if candidate is not None:
+            owner = app.store.get(candidate.token)
+            if owner is not None and (owner.chat_key or "").startswith(PRIVATE_KEY):
+                return candidate, True
+    return None, False
+
+
 def _terms_pending_for(
     app: "App",
     user: User,
@@ -451,6 +559,7 @@ async def handle_chat_message(app: "App", message: Message) -> None:
         # не должна уехать в соседний бланк или в другой чат.
         target = _reply_contract(app, message, key)
         pending: PendingSignature | None = None
+        date_pending, date_loose = _date_pending_for(app, user, message, key, target)
         terms_pending, terms_loose = _terms_pending_for(app, user, message, key, target)
         terms_contract: Contract | None = None
         if target is not None:
@@ -484,6 +593,33 @@ async def handle_chat_message(app: "App", message: Message) -> None:
                 terms_pending = None
             else:
                 pending = None
+
+        if date_pending is not None:
+            contract_for_date = app.store.get(date_pending.token)
+            if contract_for_date is None:
+                app.store.clear_pending_date(user.id, date_pending.token)
+                await say(app.config.text("guest.contract_expired", bot=app.bot_username))
+                return
+            if not accept_input:
+                return
+            if not text:
+                await say(app.config.text("guest.text_only"))
+                return
+            app.note(
+                f"date input user={user.id} token={date_pending.token} "
+                f"loose={date_loose}"
+            )
+            await handle_date_text(
+                app,
+                message,
+                user,
+                text,
+                say,
+                contract_for_date,
+                date_pending,
+                ignore_chat=date_loose,
+            )
+            return
 
         if terms_pending is not None:
             contract_for_terms = app.store.get(terms_pending.token)
@@ -582,6 +718,21 @@ async def handle_chat_message(app: "App", message: Message) -> None:
     if query:
         template = app.config.templates.find(query)
         if template is None:
+            date_pending, date_loose = _date_pending_for(app, user, message, key, None)
+            if date_pending is not None and accept_input:
+                contract_for_date = app.store.get(date_pending.token)
+                if contract_for_date is not None:
+                    await handle_date_text(
+                        app,
+                        message,
+                        user,
+                        query,
+                        say,
+                        contract_for_date,
+                        date_pending,
+                        ignore_chat=date_loose,
+                    )
+                    return
             pending = app.store.pending_for(user.id, key)
             if pending is not None and accept_input:
                 await handle_pending_text(app, message, user, query, say, pending=pending)
@@ -649,6 +800,7 @@ async def handle_chat_message(app: "App", message: Message) -> None:
         initiator_id=user.id,
         initiator_name=_user_name(user),
         page=app.index_of(template.key),
+        date_text=default_date(app.settings.dates),
     )
     if template.has_terms:
         contract.terms_user_id = user.id
@@ -704,6 +856,10 @@ async def handle_callback(app: "App", query: CallbackQuery) -> None:
 
     if action == "ds":
         await _handle_dispute(app, query, token)
+        return
+
+    if action == "dt":
+        await _handle_date_press(app, query, token)
         return
 
     if action == "no":
@@ -922,11 +1078,40 @@ async def _handle_dispute(app: "App", query: CallbackQuery, token: str) -> None:
     # Условия пересматриваются: начатые подписи под прежней редакцией
     # продолжать незачем.
     app.store.clear_pending(token=contract.token)
+    app.store.clear_pending_date(token=contract.token)
     app.store.set_pending_terms(query.from_user.id, contract)
     ok = await app.show_dispute_prompt(
         contract, template, _user_name(query.from_user) or None
     )
     app.note(f"dispute token={contract.token} user={query.from_user.id}")
+    await query.answer("" if ok else app.config.text("errors.generic"))
+
+
+async def _handle_date_press(app: "App", query: CallbackQuery, token: str) -> None:
+    """Кнопка «📅 Дата»: попросить вписать дату ответом на карточку."""
+    contract = _live_contract(app, query, token)
+    if contract is None:
+        await query.answer(_callback_expired(app))
+        return
+
+    template = app.template_or_first(contract.template_key)
+    if template is None or template.dates is None:
+        await query.answer(app.config.text("callback.no_dates"))
+        return
+    if contract.state == STATE_SIGNED:
+        await query.answer(app.config.text("callback.done"))
+        return
+
+    editors = app.store.pending_terms_for_contract(contract.token)
+    if any(item.user_id != query.from_user.id for item in editors):
+        await query.answer(app.config.text("callback.terms_changing"))
+        return
+
+    app.store.set_pending_date(
+        query.from_user.id, contract, return_state=contract.state
+    )
+    ok = await app.show_date_prompt(contract, template)
+    app.note(f"date prompt token={contract.token} user={query.from_user.id}")
     await query.answer("" if ok else app.config.text("errors.generic"))
 
 
@@ -940,6 +1125,9 @@ async def _handle_cancel(app: "App", query: CallbackQuery, token: str) -> None:
     holders |= {
         pending.user_id for pending in app.store.pending_terms_for_contract(contract.token)
     }
+    holders |= {
+        pending.user_id for pending in app.store.pending_date_for_contract(contract.token)
+    }
     allowed = query.from_user.id in {contract.initiator_id, *holders}
     if not allowed:
         await query.answer(app.config.text("callback.not_yours"))
@@ -947,6 +1135,7 @@ async def _handle_cancel(app: "App", query: CallbackQuery, token: str) -> None:
 
     app.store.clear_pending(token=contract.token)
     app.store.clear_pending_terms(token=contract.token)
+    app.store.clear_pending_date(token=contract.token)
     template = app.template_or_first(contract.template_key)
     if template is not None:
         await app.restore_contract_view(contract, template)

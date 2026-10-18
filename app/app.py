@@ -24,7 +24,7 @@ from aiogram.types import (
 )
 
 from .config import ConfigManager, TemplateConfig
-from .render import RenderError, clear_caches, render_contract
+from .render import RenderError, clear_caches, default_date, render_contract
 from .store import (
     Contract,
     ContractStore,
@@ -60,6 +60,9 @@ class App:
         self.started_at = time.time()
         self._cleanup_task: asyncio.Task[None] | None = None
         self._warmup_lock = asyncio.Lock()
+        # Готовые картинки бланков с датой: ключ «бланк|дата» -> file_id.
+        # Живут в RAM и переживают только текущий процесс — так и задумано.
+        self._dated_files: dict[str, str] = {}
         # Короткая история событий: /debug показывает её владельцу, когда
         # «в чате что-то не так», а доступа к логам сервера нет.
         self.events: deque[str] = deque(maxlen=120)
@@ -119,6 +122,7 @@ class App:
 
     def _on_config_reload(self) -> None:
         clear_caches()
+        self._dated_files.clear()
         self.settings = self.config.settings
         self.store.ttl_seconds = self.settings.contract.ttl_minutes * 60
         self.store.pending_seconds = self.settings.contract.pending_input_minutes * 60
@@ -152,6 +156,7 @@ class App:
         for contract in self.store.contracts():
             pending = len(self.store.pending_for_contract(contract.token))
             pending += len(self.store.pending_terms_for_contract(contract.token))
+            pending += len(self.store.pending_date_for_contract(contract.token))
             signed = ",".join(contract.signatures) or "-"
             inline = (contract.inline_message_id or "-")[:20]
             revisions = len(contract.terms_revisions) + (1 if contract.terms else 0)
@@ -159,7 +164,8 @@ class App:
                 f"{contract.token} {contract.state} chat={contract.chat_key or '-'} "
                 f"tmpl={contract.template_key} inline={inline} "
                 f"msg={contract.message_id or '-'} signed={signed} pending={pending} "
-                f"terms={revisions} author={contract.terms_author_id or '-'}"
+                f"terms={revisions} author={contract.terms_author_id or '-'} "
+                f"date={contract.date_text or 'auto'}"
             )
         return lines
 
@@ -192,6 +198,60 @@ class App:
         if index is None:
             return 0
         return index % total
+
+    # -- dates -----------------------------------------------------------
+
+    def contract_date(self, contract: Contract) -> str:
+        """Дата на бланке: ручная, если её вписали, иначе сегодняшняя."""
+        return contract.date_text or default_date(self.settings.dates)
+
+    def date_max_length(self, template: TemplateConfig) -> int:
+        dates = template.dates
+        if dates is None:
+            return min(40, self.settings.limits.signature_hard_cap)
+        return min(dates.style.max_length, self.settings.limits.signature_hard_cap)
+
+    async def blank_file_id(
+        self, contract: Contract, template: TemplateConfig
+    ) -> str | None:
+        """file_id картинки бланка — с датой, если она на бланке есть.
+
+        Готовые файлы бланков лежат в storage без даты, поэтому для превью
+        и карточек рисуем дату и один раз загружаем картинку. Кэш — по паре
+        «бланк + дата»: автоматическая дата переиспользуется всеми, ручная
+        живёт своей записью.
+        """
+        if contract.blank_file_id:
+            return contract.blank_file_id
+        base = self.storage.file_id(template.key)
+        if not template.has_dates and not template.is_custom:
+            return base
+
+        date_text = self.contract_date(contract)
+        cache_key = f"{template.key}|{date_text}"
+        cached = self._dated_files.get(cache_key)
+        if cached:
+            return cached
+        try:
+            data = render_contract(
+                template,
+                {},
+                date=date_text,
+                settings=self.settings.render,
+            )
+            file_id = await self.storage.preview_image(
+                self.bot,
+                data,
+                f"Бланк: {html.escape(template.title)}",
+                key=template.key,
+            )
+        except Exception:  # noqa: BLE001
+            log.exception("Не удалось нарисовать бланк %s с датой", template.key)
+            return base
+        if len(self._dated_files) >= 120:
+            self._dated_files.clear()
+        self._dated_files[cache_key] = file_id
+        return file_id
 
     def max_length_for(self, template: TemplateConfig) -> int:
         cap = self.settings.limits.signature_hard_cap
@@ -236,7 +296,7 @@ class App:
         normal photo message.  Either way the contract remembers the handle:
         ``inline_message_id`` or ``chat_id`` + ``message_id``.
         """
-        file_id = file_id or self.storage.file_id(template.key)
+        file_id = file_id or await self.blank_file_id(contract, template)
         if not file_id:
             await self.post_text(message, self.config.text("guest.no_templates"))
             return False
@@ -292,7 +352,7 @@ class App:
         old_chat, old_message = contract.chat_id, contract.message_id
 
         if contract.state == STATE_OPEN:
-            file_id = contract.blank_file_id or self.storage.file_id(template.key)
+            file_id = await self.blank_file_id(contract, template)
             if not file_id:
                 return False
             ok = await self.reply_with_photo(
@@ -309,7 +369,9 @@ class App:
                 contract,
                 template,
                 ui.terms_prompt(self.config, template, template.terms_max_length),
-                ui.terms_prompt_markup(self.config, contract.token),
+                ui.terms_prompt_markup(
+                    self.config, contract.token, date=self.contract_date(contract)
+                ),
             )
         else:
             templates = self.templates()
@@ -323,8 +385,13 @@ class App:
                 contract,
                 shown,
                 ui.preview_caption(self.config, shown, index, len(templates)),
-                ui.preview_markup(self.config, contract.token, index, len(templates)),
-                file_id=self.storage.file_id(shown.key),
+                ui.preview_markup(
+                    self.config,
+                    contract.token,
+                    index,
+                    len(templates),
+                    date=self.contract_date(contract),
+                ),
             )
 
         if not ok:
@@ -389,6 +456,7 @@ class App:
             template,
             set(contract.signatures),
             dispute=self.can_dispute(contract, template),
+            date=self.contract_date(contract),
         )
 
     async def send_preview(
@@ -403,7 +471,13 @@ class App:
             contract,
             template,
             ui.preview_caption(self.config, template, index, total),
-            ui.preview_markup(self.config, contract.token, index, total),
+            ui.preview_markup(
+                self.config,
+                contract.token,
+                index,
+                total,
+                date=self.contract_date(contract),
+            ),
         )
 
     async def send_terms_prompt(
@@ -419,7 +493,9 @@ class App:
             contract,
             template,
             ui.terms_prompt(self.config, template, template.terms_max_length),
-            ui.terms_prompt_markup(self.config, contract.token),
+            ui.terms_prompt_markup(
+                self.config, contract.token, date=self.contract_date(contract)
+            ),
         )
 
     async def edit_terms_prompt(
@@ -433,7 +509,9 @@ class App:
             contract,
             template,
             ui.terms_prompt(self.config, template, template.terms_max_length),
-            ui.terms_prompt_markup(self.config, contract.token),
+            ui.terms_prompt_markup(
+                self.config, contract.token, date=self.contract_date(contract)
+            ),
         )
 
     async def show_terms_contract(
@@ -447,6 +525,7 @@ class App:
                 template,
                 {},
                 terms=contract.terms,
+                date=self.contract_date(contract),
                 settings=self.settings.render,
             )
         except RenderError:
@@ -481,7 +560,7 @@ class App:
         caption: str,
         markup: InlineKeyboardMarkup | None,
     ) -> bool:
-        file_id = contract.blank_file_id or self.storage.file_id(template.key)
+        file_id = await self.blank_file_id(contract, template)
         if not file_id:
             log.warning("Нет file_id для бланка %s", template.key)
             return False
@@ -519,7 +598,13 @@ class App:
             contract,
             template,
             ui.preview_caption(self.config, template, index, total),
-            ui.preview_markup(self.config, contract.token, index, total),
+            ui.preview_markup(
+                self.config,
+                contract.token,
+                index,
+                total,
+                date=self.contract_date(contract),
+            ),
         )
 
     async def show_contract(self, contract: Contract, template: TemplateConfig) -> bool:
@@ -530,7 +615,12 @@ class App:
             ui.contract_caption(
                 self.config, template, self.max_length_for(template)
             ),
-            ui.contract_markup(self.config, contract.token, template),
+            ui.contract_markup(
+                self.config,
+                contract.token,
+                template,
+                date=self.contract_date(contract),
+            ),
         )
 
     async def show_prompt(
@@ -599,6 +689,23 @@ class App:
             ui.dispute_markup(self.config, contract.token),
         )
 
+    async def show_date_prompt(
+        self, contract: Contract, template: TemplateConfig
+    ) -> bool:
+        """Попросить человека прислать дату ответом на карточку."""
+        contract.touch()
+        return await self.edit_contract(
+            contract,
+            template,
+            ui.date_prompt(
+                self.config,
+                template,
+                self.contract_date(contract),
+                self.date_max_length(template),
+            ),
+            ui.date_markup(self.config, contract.token),
+        )
+
     async def mark_expired(self, contract: Contract) -> None:
         template = self.template_or_first(contract.template_key)
         if template is None:
@@ -613,6 +720,8 @@ class App:
     async def restore_contract_view(self, contract: Contract, template: TemplateConfig) -> None:
         if contract.state == STATE_PREVIEW:
             await self.show_preview_page(contract, contract.page)
+        elif contract.state == STATE_TERMS and template.terms is not None and not contract.terms:
+            await self.edit_terms_prompt(contract, template)
         else:
             await self.edit_contract(
                 contract,
@@ -633,6 +742,7 @@ class App:
                 signature_texts,
                 self_sign_note=note,
                 terms=contract.terms or None,
+                date=self.contract_date(contract),
                 settings=self.settings.render,
             )
         except RenderError as exc:

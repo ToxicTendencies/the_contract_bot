@@ -22,6 +22,7 @@ from app.config import (
     CONFIG_DIR,
     DEFAULT_FONT,
     ConfigError,
+    DateSettings,
     Limits,
     RenderSettings,
     TemplateConfig,
@@ -30,10 +31,12 @@ from app.config import (
 )
 from app.render import (
     RenderError,
+    build_canvas,
     count_graphemes,
     debug_image,
+    default_date,
+    format_date,
     layout_text,
-    load_template_image,
     render_contract,
     split_graphemes,
 )
@@ -380,12 +383,17 @@ def load_everything(templates_path: Path, texts_path: Path):
         max_lines=int((settings_raw.get("limits") or {}).get("max_lines", 2)),
         min_font_scale=float((settings_raw.get("limits") or {}).get("min_font_scale", 0.6)),
     )
+    dates_raw = settings_raw.get("dates") or {}
+    dates = DateSettings(
+        timezone=str(dates_raw.get("timezone", "Europe/Moscow")),
+        format=str(dates_raw.get("format", "%d.%m.%Y")),
+    )
     warnings: list[str] = []
     templates = load_templates(templates_path, limits, warnings=warnings)
     texts = {}
     if texts_path.exists():
         texts = yaml.safe_load(texts_path.read_text(encoding="utf-8")) or {}
-    return templates, limits, render_settings, texts, warnings
+    return templates, limits, render_settings, texts, warnings, dates
 
 
 def sample_text(field, mode: str, limits: Limits) -> str:
@@ -478,7 +486,7 @@ def cmd_make_blanks(args: argparse.Namespace) -> int:
 
 
 def cmd_debug(args: argparse.Namespace) -> int:
-    templates, _, _, _, warnings = load_everything(args.templates, args.texts)
+    templates, _, _, _, warnings, _ = load_everything(args.templates, args.texts)
     for warning in warnings:
         print(f"  ! {warning}")
     out_dir = Path(args.out) if args.out else SAMPLES_DIR
@@ -496,6 +504,12 @@ def cmd_debug(args: argparse.Namespace) -> int:
                 f"font={field.style.font.name} size={field.style.font_size} "
                 f"max={field.style.max_length}"
             )
+        if template.dates is not None:
+            dates = template.dates
+            print(
+                f"    dates: box=[{dates.box.x}, {dates.box.y}, {dates.box.w}, {dates.box.h}] "
+                f"format={dates.fmt!r} max={dates.style.max_length}"
+            )
         if template.terms is not None:
             terms = template.terms
             print(
@@ -503,6 +517,12 @@ def cmd_debug(args: argparse.Namespace) -> int:
                 f"font={terms.style.font.name} size={terms.style.font_size} "
                 f"max={terms.style.max_length} строк={terms.style.max_lines}"
             )
+        if template.background is not None:
+            bg = template.background
+            print(f"    background: {bg.image.name} fit={bg.fit} dim={bg.dim} blur={bg.blur}")
+        if template.frame is not None:
+            frame = template.frame
+            print(f"    frame: inset={frame.inset} width={frame.width} double={frame.double}")
         if template.note:
             note = template.note
             print(
@@ -515,7 +535,9 @@ def cmd_debug(args: argparse.Namespace) -> int:
 def cmd_check(args: argparse.Namespace) -> int:
     problems: list[str] = []
     try:
-        templates, limits, _, texts, warnings = load_everything(args.templates, args.texts)
+        templates, limits, _, texts, warnings, _dates = load_everything(
+            args.templates, args.texts
+        )
     except ConfigError as exc:
         print(f"✗ {exc}")
         return 1
@@ -525,7 +547,7 @@ def cmd_check(args: argparse.Namespace) -> int:
 
     for template in templates.ordered():
         try:
-            image = load_template_image(template.file)
+            image = build_canvas(template)
         except RenderError as exc:
             problems.append(str(exc))
             continue
@@ -556,6 +578,18 @@ def cmd_check(args: argparse.Namespace) -> int:
                 )
         if total < 2:
             print(f"  ! {template.key}: подписантов меньше двух — это допустимо")
+        if template.dates is not None:
+            sample = format_date(template.dates, "18.10.2026")
+            layout = layout_text(
+                sample,
+                template.dates.box,
+                template.dates.style,
+                max_lines=template.dates.style.max_lines,
+            )
+            if layout is None:
+                problems.append(f"{template.key}.dates: образец {sample!r} не помещается")
+            else:
+                print(f"    dates: {sample!r} → кегль {layout.font_size}")
         if template.terms is not None:
             layout = layout_text(
                 TERMS_SAMPLE,
@@ -606,7 +640,7 @@ def cmd_check(args: argparse.Namespace) -> int:
 
 
 def cmd_list(args: argparse.Namespace) -> int:
-    templates, limits, _, _, _ = load_everything(args.templates, args.texts)
+    templates, _limits, _, _, _, _ = load_everything(args.templates, args.texts)
     print(f"Бланков: {len(templates)}")
     for template in templates.ordered():
         print(f"• {template.key}: {template.title}")
@@ -616,12 +650,16 @@ def cmd_list(args: argparse.Namespace) -> int:
         print(f"  пометка: {'да' if template.note else 'нет'}")
         if template.terms is not None:
             print(f"  условия: до {template.terms.style.max_length} символов, печатаются на бланке")
+        if template.dates is not None:
+            print(f"  дата: {template.dates.fmt!r} в box {template.dates.box}")
+        if template.is_custom:
+            print(f"  свой бланк: холст {template.canvas[0]}x{template.canvas[1]}")
         print(f"  лимит: {min(f.style.max_length for f in template.fields.values())} символов")
     return 0
 
 
 def cmd_render(args: argparse.Namespace) -> int:
-    templates, limits, render_settings, texts, warnings = load_everything(
+    templates, limits, render_settings, texts, warnings, dates = load_everything(
         args.templates, args.texts
     )
     for warning in warnings:
@@ -643,6 +681,7 @@ def cmd_render(args: argparse.Namespace) -> int:
                     signatures,
                     self_sign_note=note if mode == "self_signed" else None,
                     terms=TERMS_SAMPLE if template.terms is not None else None,
+                    date=default_date(dates),
                     settings=render_settings,
                 )
             except RenderError as exc:

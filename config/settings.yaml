@@ -11,6 +11,12 @@ contract:
   # Как часто фоновая задача чистит просроченное.
   cleanup_interval_seconds: 30
 
+dates:
+  # Часовой пояс, по которому бот считает «сегодня».
+  timezone: Europe/Moscow
+  # Формат даты на бланке (strftime).
+  format: "%d.%m.%Y"
+
 limits:
   # Лимит по умолчанию, если в templates.yaml у поля не указан свой.
   signature_max_length: 32

@@ -1,0 +1,101 @@
+# Свои бланки: фон, шрифт, рамка и координаты.
+#
+# Скопируй файл в config/custom_templates.yaml — бот подхватит его при
+# старте и перечитает по /reload. Ключи бланков из этого файла не должны
+# совпадать с ключами из templates.yaml.
+#
+# Все пути считаются от корня репозитория (где лежат bot.py и config/).
+# Проверить вёрстку:  python generate_samples.py --check
+# Посмотреть рамки:   python generate_samples.py --debug-boxes
+
+fonts:
+  # Свой шрифт: положи .ttf/.otf в assets/fonts/ и укажи путь.
+  # Можно использовать и любой из алиасов templates.yaml: serif, comic,
+  # handwriting, display.
+  my_font: assets/fonts/Caveat-Variable.ttf
+
+defaults:
+  font: my_font
+  font_size: 48
+  color: "#1b2a4a"
+  align: center
+  valign: middle
+  max_length: 32
+  max_lines: 2
+
+templates:
+  my_contract:
+    title: "Мой контракт"
+    description: "Свой фон и рамка"
+    tags: ["свой", "мой"]
+    keywords: ["свой бланк", "кастом"]
+
+    # Холст: ширина и высота картинки в пикселях. Если указан file,
+    # размеры берутся из файла, а canvas игнорируется.
+    canvas: [1240, 1754]
+
+    # Фон рисуется, когда file не указан. Любая картинка: png/jpg/webp.
+    # Замените путь на свою картинку: без файла бланк будет пропущен.
+    background:
+      image: assets/backgrounds/paper.jpg
+      fit: cover        # cover | contain | stretch
+      dim: 0.10         # затемнение 0..0.9
+      blur: 0           # размытие в пикселях
+
+    # Рамка поверх фона. Можно картинку-оверлей (png с прозрачностью)
+    # или линии. Если указан image, остальные поля игнорируются.
+    frame:
+      # image: assets/frames/gold.png
+      color: "#1b2a4a"
+      width: 4
+      inset: 40
+      gap: 8
+      double: false
+      corners: false
+      radius: 0
+
+    # Дата: печатается автоматически по settings.dates, кнопка «📅 Дата»
+    # позволяет вписать свою. {date} — подстановка.
+    dates:
+      box: [780, 105, 370, 60]
+      font: serif
+      font_size: 27
+      color: "#4a5568"
+      align: right
+      valign: middle
+      max_length: 40
+      format: "Дата: {date}"
+
+    fields:
+      party1:
+        label: "Сторона 1"
+        sample: "Иванов И.И."
+        box: [78, 1280, 500, 140]
+        # Необязательная дата подписи под полем:
+        date:
+          box: [78, 1430, 500, 44]
+          font_size: 20
+          align: center
+          format: "подписано {date}"
+      party2:
+        label: "Сторона 2"
+        sample: "Петров П.П."
+        box: [662, 1280, 500, 140]
+
+    # Необязательный блок свободных условий — как у free в templates.yaml.
+    # terms:
+    #   box: [110, 430, 1020, 610]
+    #   font: serif
+    #   font_size: 32
+    #   max_length: 700
+    #   max_lines: 18
+    #   min_font_scale: 0.45
+    #   line_spacing: 1.42
+
+    # Маленькая пометка, если обе подписи поставил один человек.
+    self_sign_note:
+      box: [78, 1488, 1084, 72]
+      font: comic
+      font_size: 32
+      color: "#a33a2e"
+      align: center

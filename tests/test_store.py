@@ -263,3 +263,59 @@ def test_terms_pending_expires_with_the_rest():
     expired = store.expire_pending()
     assert [item.token for item in expired] == [contract.token]
     assert store.pending_terms_for(20) is None
+
+
+# ---------------------------------------------------------------------------
+# manual date
+# ---------------------------------------------------------------------------
+
+
+def test_create_stores_date_text():
+    store = make_store()
+    contract = store.create(
+        chat_key="g1", template_key="classic", date_text="01.02.2027"
+    )
+    assert contract.date_text == "01.02.2027"
+    assert contract.date_auto is True
+    auto = store.create(chat_key="g2", template_key="classic")
+    assert auto.date_text is None and auto.date_auto is True
+
+
+def test_pending_date_is_exclusive():
+    store = make_store()
+    contract = store.create(chat_key="g1", template_key="classic", initiator_id=10)
+
+    store.set_pending(10, contract, "party1")
+    date_pending = store.set_pending_date(10, contract, return_state=STATE_PREVIEW)
+    assert store.pending_for(10, token=contract.token) is None
+    assert store.pending_terms_for(10, token=contract.token) is None
+    assert store.pending_date_for(10, token=contract.token) is date_pending
+    assert date_pending.return_state == STATE_PREVIEW
+    assert store.pending_count == 1
+
+    # Подпись отменяет ожидание даты.
+    store.set_pending(10, contract, "party1")
+    assert store.pending_date_for(10, token=contract.token) is None
+
+    # И наоборот: дата отменяет условия.
+    store.set_pending_terms(10, contract)
+    assert store.pending_date_for(10, token=contract.token) is None
+    store.set_pending_date(10, contract)
+    assert store.pending_terms_for(10, token=contract.token) is None
+
+
+def test_pending_date_expires_and_is_dropped_with_contract():
+    store = make_store()
+    contract = store.create(chat_key="g1", template_key="classic", initiator_id=10)
+    pending = store.set_pending_date(10, contract)
+
+    assert store.expire_pending(now=pending.deadline - 1) == []
+    assert store.pending_date_for(10) is not None
+    expired = store.expire_pending(now=pending.deadline + 1)
+    assert pending in expired
+    assert store.pending_date_for(10) is None
+
+    second = store.create(chat_key="g2", template_key="classic", initiator_id=20)
+    store.set_pending_date(20, second)
+    store.drop(second)
+    assert store.pending_date_for(20) is None

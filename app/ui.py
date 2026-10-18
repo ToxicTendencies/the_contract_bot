@@ -89,7 +89,22 @@ def _column(buttons: list[InlineKeyboardButton]) -> list[list[InlineKeyboardButt
     return [[button] for button in buttons]
 
 
-def preview_markup(cfg: ConfigManager, token: str, index: int, total: int) -> InlineKeyboardMarkup:
+def date_button(cfg: ConfigManager, token: str, date_text: str) -> InlineKeyboardButton | None:
+    """Кнопка «Дата: 18.10.2026» — открывает ручной ввод."""
+    if not date_text:
+        return None
+    label = _trim(_q(cfg, "buttons.date", date=date_text), 60)
+    return InlineKeyboardButton(text=label, callback_data=f"dt:{token}")
+
+
+def preview_markup(
+    cfg: ConfigManager,
+    token: str,
+    index: int,
+    total: int,
+    *,
+    date: str = "",
+) -> InlineKeyboardMarkup:
     prev_index = (index - 1) % total
     next_index = (index + 1) % total
     buttons = [
@@ -97,10 +112,19 @@ def preview_markup(cfg: ConfigManager, token: str, index: int, total: int) -> In
         InlineKeyboardButton(text=_q(cfg, "buttons.pick"), callback_data=f"pk:{token}:{index}"),
         InlineKeyboardButton(text=_q(cfg, "buttons.next"), callback_data=f"pn:{token}:{next_index}"),
     ]
+    date_btn = date_button(cfg, token, date)
+    if date_btn is not None:
+        buttons.append(date_btn)
     return InlineKeyboardMarkup(inline_keyboard=_column(buttons))
 
 
-def contract_markup(cfg: ConfigManager, token: str, template: TemplateConfig) -> InlineKeyboardMarkup:
+def contract_markup(
+    cfg: ConfigManager,
+    token: str,
+    template: TemplateConfig,
+    *,
+    date: str = "",
+) -> InlineKeyboardMarkup:
     buttons = [
         InlineKeyboardButton(
             text=_sign_button_text(cfg, field.label),
@@ -108,24 +132,29 @@ def contract_markup(cfg: ConfigManager, token: str, template: TemplateConfig) ->
         )
         for field in template.fields.values()
     ]
+    date_btn = date_button(cfg, token, date)
+    if date_btn is not None:
+        buttons.append(date_btn)
     buttons.append(
         InlineKeyboardButton(text=_q(cfg, "buttons.cancel"), callback_data=f"cx:{token}")
     )
     return InlineKeyboardMarkup(inline_keyboard=_column(buttons))
 
 
-def terms_prompt_markup(cfg: ConfigManager, token: str) -> InlineKeyboardMarkup:
+def terms_prompt_markup(
+    cfg: ConfigManager, token: str, *, date: str = ""
+) -> InlineKeyboardMarkup:
     """Пока условий нет, их может предложить любой — кнопка видна сразу."""
-    return InlineKeyboardMarkup(
-        inline_keyboard=_column(
-            [
-                InlineKeyboardButton(
-                    text=_trim(_q(cfg, "buttons.propose_terms"), 60),
-                    callback_data=f"ds:{token}",
-                )
-            ]
+    buttons = [
+        InlineKeyboardButton(
+            text=_trim(_q(cfg, "buttons.propose_terms"), 60),
+            callback_data=f"ds:{token}",
         )
-    )
+    ]
+    date_btn = date_button(cfg, token, date)
+    if date_btn is not None:
+        buttons.append(date_btn)
+    return InlineKeyboardMarkup(inline_keyboard=_column(buttons))
 
 
 def signed_buttons_markup(
@@ -135,6 +164,7 @@ def signed_buttons_markup(
     signed: set[str],
     *,
     dispute: bool = False,
+    date: str = "",
 ) -> InlineKeyboardMarkup:
     buttons: list[InlineKeyboardButton] = []
     for field in template.fields.values():
@@ -152,6 +182,9 @@ def signed_buttons_markup(
                 callback_data=f"ds:{token}",
             )
         )
+    date_btn = date_button(cfg, token, date)
+    if date_btn is not None:
+        buttons.append(date_btn)
     buttons.append(
         InlineKeyboardButton(text=_q(cfg, "buttons.cancel"), callback_data=f"cx:{token}")
     )
@@ -160,6 +193,14 @@ def signed_buttons_markup(
 
 def dispute_markup(cfg: ConfigManager, token: str) -> InlineKeyboardMarkup:
     """Пока человек печатает новую редакцию, подписывать нечего."""
+    buttons = [
+        InlineKeyboardButton(text=_q(cfg, "buttons.cancel"), callback_data=f"cx:{token}")
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=_column(buttons))
+
+
+def date_markup(cfg: ConfigManager, token: str) -> InlineKeyboardMarkup:
+    """Пока человек вписывает дату, остальные действия отменены."""
     buttons = [
         InlineKeyboardButton(text=_q(cfg, "buttons.cancel"), callback_data=f"cx:{token}")
     ]
@@ -202,6 +243,21 @@ def contract_caption(
         max_length=max_length,
     )
     return with_terms(cfg, caption, terms, author=author)
+
+
+def date_prompt(
+    cfg: ConfigManager,
+    template: TemplateConfig,
+    date: str,
+    max_length: int,
+) -> str:
+    return _q(
+        cfg,
+        "guest.date_prompt",
+        title=html.escape(template.title),
+        date=html.escape(date),
+        max_length=max_length,
+    )
 
 
 def terms_prompt(cfg: ConfigManager, template: TemplateConfig, max_length: int) -> str:
@@ -319,6 +375,10 @@ def owner_caption(
         signers=signers,
         source=html.escape(source),
     )
+    if contract.date_text:
+        caption = caption.rstrip() + "\n" + _q(
+            cfg, "archive.date_line", date=html.escape(contract.date_text)
+        )
     if contract.terms:
         caption = caption.rstrip() + "\n\n" + _q(
             cfg,

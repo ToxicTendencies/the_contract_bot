@@ -12,6 +12,7 @@ import types
 import pytest
 
 from app.handlers import handle_callback, handle_chat_message
+from app.render import default_date, render_contract
 from app.store import STATE_OPEN, STATE_PREVIEW, STATE_SIGNED, STATE_TERMS
 
 from .helpers import FakeCallback, FakeChat, FakeUser
@@ -51,6 +52,11 @@ class FakeStorage:
 
     def is_ready(self, key: str) -> bool:
         return True
+
+    async def preview_image(self, bot, data: bytes, caption: str, *, key="", filename="blank.jpg"):
+        # Превью с датой не тратит «настоящую» загрузку: тесты считают
+        # загрузки картинок с условиями, и их номера должны быть стабильны.
+        return f"file-{key}"
 
     async def upload_image(self, bot, data: bytes, caption: str, *, filename="blank.jpg"):
         self.uploads.append({"data": data, "caption": caption})
@@ -1295,7 +1301,7 @@ async def test_terms_prompt_lets_anyone_propose_terms(wired):
     contract = app.store.for_chat("g-100500")
     prompt = summon.answers[-1]
     keys = [button.callback_data for row in _rows(prompt.reply_markup) for button in row]
-    assert keys == [f"ds:{contract.token}"]
+    assert keys == [f"ds:{contract.token}", f"dt:{contract.token}"]
     assert prompt.reply_markup.inline_keyboard[0][0].text == app.config.text(
         "buttons.propose_terms"
     )
@@ -1318,3 +1324,208 @@ async def test_terms_prompt_lets_anyone_propose_terms(wired):
     assert bot.edits[-1]["reply_markup"].inline_keyboard[2][0].text == app.config.text(
         "buttons.dispute"
     )
+
+
+# ---------------------------------------------------------------------------
+# date on the contract
+# ---------------------------------------------------------------------------
+
+
+def _date_keys(result) -> list[str]:
+    return [button.callback_data for row in _rows(result.reply_markup) for button in row]
+
+
+@pytest.mark.asyncio
+async def test_date_is_automatic_and_can_be_edited(wired):
+    app, bot, storage = wired
+    anna = FakeUser(10, first_name="Аня")
+    boris = FakeUser(20, first_name="Борис")
+    today = default_date(app.settings.dates)
+
+    summon = FakeGuestMessage("@test_bot", anna)
+    await handle_chat_message(app, summon)
+    contract = app.store.for_chat("g-100500")
+    assert contract.date_text == today
+    assert contract.date_auto is True
+    assert f"dt:{contract.token}" in _date_keys(summon.answers[-1])
+
+    # Кнопка даты открывает ручной ввод.
+    press_date = await press(app, f"dt:{contract.token}", anna, contract.inline_message_id)
+    assert press_date.answers[-1] == ""
+    prompt = bot.edits[-1]["media"].caption
+    assert today in prompt
+    assert [button.callback_data for row in bot.edits[-1]["reply_markup"].inline_keyboard
+            for button in row] == [f"cx:{contract.token}"]
+
+    # Ручная дата сохраняется и переживает перерисовку.
+    reply = reply_to_bot("01.02.2027", anna, contract, query_id="date1")
+    await handle_chat_message(app, reply)
+    assert contract.date_text == "01.02.2027"
+    assert contract.date_auto is False
+    assert contract.date_user_id == anna.id
+    assert "01.02.2027" in reply.answers[-1].input_message_content.message_text
+    assert contract.state == STATE_PREVIEW
+
+    # Выбираем бланк: в кнопках — уже ручная дата.
+    pick = await press(app, f"pk:{contract.token}:0", anna, contract.inline_message_id)
+    assert pick.answers[-1] == ""
+    keys = [
+        button.callback_data
+        for row in bot.edits[-1]["reply_markup"].inline_keyboard
+        for button in row
+    ]
+    assert f"dt:{contract.token}" in keys
+    assert any("01.02.2027" in button.text for row in bot.edits[-1]["reply_markup"].inline_keyboard
+               for button in row)
+
+    # Подписи обеих сторон: в финале напечатана ручная дата.
+    await press(app, f"sg:{contract.token}:classic:party1", anna, contract.inline_message_id)
+    first = reply_to_bot("Аня", anna, contract, query_id="sign1")
+    await handle_chat_message(app, first)
+
+    await press(app, f"sg:{contract.token}:classic:party2", boris, contract.inline_message_id)
+    second = reply_to_bot("Боря", boris, contract, query_id="sign2")
+    await handle_chat_message(app, second)
+
+    assert contract.state == STATE_SIGNED
+    template = app.config.templates.get("classic")
+    expected = render_contract(
+        template,
+        {"party1": "Аня", "party2": "Боря"},
+        date="01.02.2027",
+        settings=app.settings.render,
+    )
+    assert storage.archive[-1]["data"] == expected
+    assert "01.02.2027" in storage.archive[-1]["caption"]
+
+
+@pytest.mark.asyncio
+async def test_auto_date_returns_with_word_auto(wired):
+    app, _bot, _storage = wired
+    anna = FakeUser(10, first_name="Аня")
+    today = default_date(app.settings.dates)
+
+    summon = FakeGuestMessage("@test_bot", anna)
+    await handle_chat_message(app, summon)
+    contract = app.store.for_chat("g-100500")
+
+    await press(app, f"dt:{contract.token}", anna, contract.inline_message_id)
+    reply = reply_to_bot("05.05.2030", anna, contract, query_id="date2")
+    await handle_chat_message(app, reply)
+    assert contract.date_auto is False
+
+    await press(app, f"dt:{contract.token}", anna, contract.inline_message_id)
+    reset = reply_to_bot("авто", anna, contract, query_id="date3")
+    await handle_chat_message(app, reset)
+    assert contract.date_auto is True
+    assert contract.date_text == today
+    assert contract.date_user_id == 0
+    assert today in reset.answers[-1].input_message_content.message_text
+
+
+@pytest.mark.asyncio
+async def test_bad_date_is_rejected_without_changing_contract(wired):
+    app, _bot, _storage = wired
+    anna = FakeUser(10, first_name="Аня")
+    summon = FakeGuestMessage("@test_bot", anna)
+    await handle_chat_message(app, summon)
+    contract = app.store.for_chat("g-100500")
+    before = contract.date_text
+
+    await press(app, f"dt:{contract.token}", anna, contract.inline_message_id)
+    reply = reply_to_bot("1" * 80, anna, contract, query_id="date4")
+    await handle_chat_message(app, reply)
+    assert contract.date_text == before
+    assert contract.date_auto is True
+    answer = reply.answers[-1].input_message_content.message_text
+    assert "длинн" in answer or "Слишком" in answer
+
+
+@pytest.mark.asyncio
+async def test_anyone_can_change_the_date(wired):
+    app, _bot, _storage = wired
+    anna = FakeUser(10, first_name="Аня")
+    boris = FakeUser(20, first_name="Борис")
+    summon = FakeGuestMessage("@test_bot", anna)
+    await handle_chat_message(app, summon)
+    contract = app.store.for_chat("g-100500")
+
+    # Борис не вызывал бота, но дату поменять может, как и условия.
+    await press(app, f"dt:{contract.token}", boris, contract.inline_message_id)
+    reply = reply_to_bot("09.09.2029", boris, contract, query_id="date5")
+    await handle_chat_message(app, reply)
+    assert contract.date_text == "09.09.2029"
+    assert contract.date_user_id == boris.id
+
+
+@pytest.mark.asyncio
+async def test_date_button_on_terms_prompt_returns_to_terms(wired):
+    app, bot, _storage = wired
+    anna = FakeUser(10, first_name="Аня")
+    summon = FakeGuestMessage("@test_bot условия", anna)
+    await handle_chat_message(app, summon)
+    contract = app.store.for_chat("g-100500")
+    assert contract.state == STATE_TERMS
+    prompt = summon.answers[-1]
+    assert f"dt:{contract.token}" in _date_keys(prompt)
+    assert f"ds:{contract.token}" in _date_keys(prompt)
+
+    await press(app, f"dt:{contract.token}", anna, contract.inline_message_id)
+    reply = reply_to_bot("07.07.2028", anna, contract, query_id="date6")
+    await handle_chat_message(app, reply)
+    assert contract.date_text == "07.07.2028"
+    assert contract.state == STATE_TERMS
+    assert contract.blank_file_id is None
+    assert "условиями" in bot.edits[-1]["media"].caption
+
+
+@pytest.mark.asyncio
+async def test_member_mode_date_edit(wired):
+    """Бот в чате: дата меняется кнопкой на обычном сообщении."""
+    app, _bot, _storage = wired
+    chat = FakeChat(-100777)
+    anna = FakeUser(10, first_name="Аня")
+    bot_user = FakeUser(999, first_name="Bot", is_bot=True, username="test_bot")
+
+    summon = FakeChatMessage("@test_bot", anna, chat)
+    await handle_chat_message(app, summon)
+    contract = app.store.for_chat("g-100777")
+    card_id = contract.message_id
+
+    query = FakeCallback(f"dt:{contract.token}", anna)
+    query.inline_message_id = None
+    query.message = types.SimpleNamespace(
+        chat=types.SimpleNamespace(id=-100777), message_id=card_id
+    )
+    await handle_callback(app, query)
+    assert query.answers[-1] == ""
+
+    reply = FakeChatMessage(
+        "01.02.2027",
+        anna,
+        chat,
+        reply_to=types.SimpleNamespace(from_user=bot_user, message_id=card_id),
+    )
+    await handle_chat_message(app, reply)
+    assert contract.date_text == "01.02.2027"
+    assert "01.02.2027" in reply.replies[-1]
+    assert contract.message_id == card_id
+
+
+@pytest.mark.asyncio
+async def test_private_chat_date_edit(wired):
+    """Личка двух людей: второй участник вписывает дату в своей «версии» чата."""
+    app, _bot, _storage = wired
+    anna = FakeUser(10, first_name="Аня", username="anna")
+    boris = FakeUser(20, first_name="Борис", username="boris")
+    anna_chat = FakeChat(boris.id, type="private")
+    boris_chat = FakeChat(anna.id, type="private")
+
+    await handle_chat_message(app, FakeGuestMessage("@test_bot", anna, anna_chat))
+    contract = app.store.for_chat("p10:20")
+
+    await press(app, f"dt:{contract.token}", boris, contract.inline_message_id)
+    reply = reply_to_bot("03.03.2030", boris, contract, chat=boris_chat, query_id="date7")
+    await handle_chat_message(app, reply)
+    assert contract.date_text == "03.03.2030"
+    assert contract.date_user_id == boris.id

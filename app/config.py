@@ -153,6 +153,14 @@ class StorageSettings:
 
 
 @dataclass(frozen=True)
+class DateSettings:
+    """Как бот понимает «сегодня» и в каком виде печатает дату."""
+
+    timezone: str = "Europe/Moscow"
+    format: str = "%d.%m.%Y"
+
+
+@dataclass(frozen=True)
 class Settings:
     bot_token: str
     owner_id: int
@@ -162,6 +170,7 @@ class Settings:
     limits: Limits
     render: RenderSettings
     storage: StorageSettings
+    dates: DateSettings = DateSettings()
 
 
 def load_settings(
@@ -205,6 +214,7 @@ def load_settings(
     render_raw = _mapping(raw.get("render"), "render")
     storage_cfg_raw = _mapping(raw.get("storage"), "storage")
     logging_raw = _mapping(raw.get("logging"), "logging")
+    dates_raw = _mapping(raw.get("dates"), "dates")
 
     contract = ContractSettings(
         ttl_minutes=_as_int(contract_raw.get("ttl_minutes", 60), "contract.ttl_minutes", minimum=1),
@@ -261,6 +271,16 @@ def load_settings(
         file_ids_file=str(storage_cfg_raw.get("file_ids_file", "file_ids.json")),
     )
 
+    timezone = str(dates_raw.get("timezone", "Europe/Moscow")).strip() or "Europe/Moscow"
+    try:
+        from zoneinfo import ZoneInfo
+
+        ZoneInfo(timezone)
+    except Exception as exc:  # noqa: BLE001 - ZoneInfo raises several types
+        raise ConfigError(f"dates.timezone: неизвестный часовой пояс {timezone!r}") from exc
+    date_format = str(dates_raw.get("format", "%d.%m.%Y")).strip() or "%d.%m.%Y"
+    dates = DateSettings(timezone=timezone, format=date_format)
+
     log_level = (os.getenv("LOG_LEVEL") or logging_raw.get("level") or "INFO").upper()
     if log_level not in {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}:
         raise ConfigError(f"Неизвестный уровень логирования: {log_level}")
@@ -274,6 +294,7 @@ def load_settings(
         limits=limits,
         render=render,
         storage=storage,
+        dates=dates,
     )
 
 
@@ -345,12 +366,47 @@ class TextStyle:
 
 
 @dataclass(frozen=True)
+class DateConfig:
+    """Дата на бланке: прямоугольник, стиль и шаблон строки (``{date}``)."""
+
+    box: Box
+    style: TextStyle
+    fmt: str = "{date}"
+
+
+@dataclass(frozen=True)
 class FieldConfig:
     key: str
     label: str
     box: Box
     style: TextStyle
     sample: str = ""
+    # Необязательная дата подписи под полем.
+    date: DateConfig | None = None
+
+
+@dataclass(frozen=True)
+class BackgroundConfig:
+    """Свой фон: любая картинка, вписывается в холст бланка."""
+
+    image: Path
+    fit: str = "cover"  # cover | contain | stretch
+    dim: float = 0.0  # затемнение 0..1
+    blur: float = 0.0  # размытие в пикселях
+
+
+@dataclass(frozen=True)
+class FrameConfig:
+    """Рамка: картинка-оверлей или линии, нарисованные поверх фона."""
+
+    image: Path | None = None
+    color: str = "#1b2a4a"
+    width: int = 4
+    inset: int = 40
+    gap: int = 8
+    double: bool = False
+    corners: bool = False
+    radius: int = 0
 
 
 @dataclass(frozen=True)
@@ -370,7 +426,7 @@ class TermsConfig:
 @dataclass(frozen=True)
 class TemplateConfig:
     key: str
-    file: Path
+    file: Path | None
     title: str
     description: str
     tags: tuple[str, ...]
@@ -379,6 +435,20 @@ class TemplateConfig:
     terms: TermsConfig | None = None
     sort: int = 0
     keywords: tuple[str, ...] = ()
+    # Дата составления: печатается автоматически, можно переписать вручную.
+    dates: DateConfig | None = None
+    background: BackgroundConfig | None = None
+    frame: FrameConfig | None = None
+    canvas: tuple[int, int] = (1240, 1754)
+
+    @property
+    def has_dates(self) -> bool:
+        return self.dates is not None
+
+    @property
+    def is_custom(self) -> bool:
+        """Бланк собирается на лету из фона и рамки."""
+        return self.file is None
 
     @property
     def has_terms(self) -> bool:
@@ -603,6 +673,113 @@ def _style_from(
     )
 
 
+def _parse_path(value: Any, name: str, *, strict: bool) -> Path | None:
+    if value is None or str(value).strip() == "":
+        return None
+    path = _resolve_path(str(value))
+    if not path.exists():
+        message = f"{name}: файл не найден: {path}"
+        if strict:
+            raise ConfigError(message)
+        log.warning("%s", message)
+        return None
+    return path
+
+
+def _parse_background(value: Any, name: str, *, strict: bool) -> BackgroundConfig | None:
+    """Свой фон: строка-путь или блок с настройками вписывания."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        raw: dict[str, Any] = {"image": value}
+    elif isinstance(value, dict):
+        if value.get("enabled", True) is False:
+            return None
+        raw = value
+    else:
+        raise ConfigError(f"{name}: ожидался путь к картинке или словарь")
+
+    image = _parse_path(raw.get("image"), f"{name}.image", strict=strict)
+    if image is None:
+        return None
+    fit = str(raw.get("fit", "cover")).lower()
+    if fit not in {"cover", "contain", "stretch"}:
+        raise ConfigError(f"{name}.fit: одно из cover, contain, stretch")
+    dim = _as_float(raw.get("dim", 0.0), f"{name}.dim", minimum=0.0, maximum=0.9)
+    blur = _as_float(raw.get("blur", 0.0), f"{name}.blur", minimum=0.0, maximum=40.0)
+    return BackgroundConfig(image=image, fit=fit, dim=dim, blur=blur)
+
+
+def _parse_frame(value: Any, name: str, *, strict: bool) -> FrameConfig | None:
+    if value is None or not isinstance(value, dict):
+        if value is not None:
+            raise ConfigError(f"{name}: ожидался словарь")
+        return None
+    if value.get("enabled", True) is False:
+        return None
+
+    image = _parse_path(value.get("image"), f"{name}.image", strict=strict)
+    color = str(value.get("color", "#1b2a4a"))
+    try:
+        ImageColor.getrgb(color)
+    except ValueError as exc:
+        raise ConfigError(f"{name}.color: неизвестный цвет {color!r}") from exc
+
+    return FrameConfig(
+        image=image,
+        color=color,
+        width=_as_int(value.get("width", 4), f"{name}.width", minimum=1),
+        inset=_as_int(value.get("inset", 40), f"{name}.inset", minimum=0),
+        gap=_as_int(value.get("gap", 8), f"{name}.gap", minimum=0),
+        double=bool(value.get("double", False)),
+        corners=bool(value.get("corners", False)),
+        radius=_as_int(value.get("radius", 0), f"{name}.radius", minimum=0),
+    )
+
+
+def _parse_dates(
+    raw: Any,
+    defaults: dict[str, Any],
+    fonts: dict[str, Path],
+    limits: Limits,
+    name: str,
+    strict: bool,
+    *,
+    width: int,
+    height: int,
+    fallback: dict[str, Any] | None = None,
+) -> DateConfig | None:
+    """Дата на бланке (``dates``) или подпись под полем (``field.date``)."""
+    if not isinstance(raw, dict) or raw.get("enabled", True) is False:
+        return None
+    try:
+        box = parse_box(raw.get("box"), f"{name}.box")
+        if box.x < 0 or box.y < 0 or box.right > width or box.bottom > height:
+            raise ConfigError(
+                f"{name}.box выходит за картинку {width}x{height}: {box}"
+            )
+        date_defaults = dict(defaults)
+        date_defaults.update(fallback or {})
+        date_defaults.update({"max_length": 40, "max_lines": 1, "min_font_scale": 0.5})
+        style = _style_from(
+            raw,
+            date_defaults,
+            fonts,
+            limits,
+            name,
+            strict,
+            max_length_cap=120,
+            max_lines_cap=2,
+        )
+        fmt = str(raw.get("format", "{date}"))
+    except ConfigError as exc:
+        if strict:
+            raise
+        log.error("%s", exc)
+        return None
+    return DateConfig(box=box, style=style, fmt=fmt)
+
+
 def _image_size(path: Path) -> tuple[int, int]:
     try:
         with Image.open(path) as img:
@@ -616,11 +793,35 @@ def load_templates(
     limits: Limits | None = None,
     strict: bool = False,
     warnings: list[str] | None = None,
+    extra_paths: Iterable[Path] = (),
 ) -> TemplatesConfig:
-    """Load templates.  In non-strict mode broken templates are skipped."""
+    """Load templates.  In non-strict mode broken templates are skipped.
+
+    ``extra_paths`` — дополнительные файлы бланков (например,
+    ``custom_templates.yaml`` с бланками, собранными пользователем).
+    Их шрифты и настройки по умолчанию дополняют основной файл.
+    """
     limits = limits or Limits()
     raw = _read_yaml(path)
     warnings = warnings if warnings is not None else []
+
+    merged = dict(raw)
+    merged_templates: dict[str, Any] = dict(_mapping(raw.get("templates"), "templates"))
+    merged_fonts: dict[str, Any] = dict(_mapping(raw.get("fonts"), "fonts"))
+    merged_defaults: dict[str, Any] = dict(_mapping(raw.get("defaults"), "defaults"))
+    for extra in extra_paths:
+        if extra is None or not Path(extra).exists():
+            continue
+        extra_raw = _read_yaml(Path(extra))
+        merged_fonts.update(_mapping(extra_raw.get("fonts"), f"{extra}.fonts"))
+        merged_defaults.update(_mapping(extra_raw.get("defaults"), f"{extra}.defaults"))
+        merged_templates.update(
+            _mapping(extra_raw.get("templates"), f"{extra}.templates")
+        )
+    merged["fonts"] = merged_fonts
+    merged["defaults"] = merged_defaults
+    merged["templates"] = merged_templates
+    raw = merged
 
     fonts_raw = _mapping(raw.get("fonts"), "fonts")
     fonts: dict[str, Path] = {
@@ -645,23 +846,69 @@ def load_templates(
             continue
 
         file_value = template_raw.get("file")
-        if not file_value:
-            message = f"templates.{key}.file: не указан файл"
-            if strict:
-                raise ConfigError(message)
-            warnings.append(message)
-            continue
-        file_path = _resolve_path(str(file_value))
-        if not file_path.exists():
-            message = f"templates.{key}.file: файл не найден: {file_path}"
-            if strict:
-                raise ConfigError(message)
-            warnings.append(message)
-            log.error("%s", message)
-            continue
+        file_path: Path | None = None
+        if file_value:
+            file_path = _resolve_path(str(file_value))
+            if not file_path.exists():
+                message = f"templates.{key}.file: файл не найден: {file_path}"
+                if strict:
+                    raise ConfigError(message)
+                warnings.append(message)
+                log.error("%s", message)
+                continue
 
         try:
-            width, height = _image_size(file_path)
+            background = _parse_background(
+                template_raw.get("background"), f"templates.{key}.background", strict=strict
+            )
+            frame = _parse_frame(
+                template_raw.get("frame"), f"templates.{key}.frame", strict=strict
+            )
+        except ConfigError as exc:
+            if strict:
+                raise
+            warnings.append(str(exc))
+            log.error("%s", exc)
+            continue
+
+        if file_path is None and background is None:
+            message = f"templates.{key}: нужен file или background"
+            if strict:
+                raise ConfigError(message)
+            warnings.append(message)
+            continue
+
+        canvas_raw = template_raw.get("canvas")
+        canvas = (1240, 1754)
+        if canvas_raw is not None:
+            try:
+                if (
+                    not isinstance(canvas_raw, (list, tuple))
+                    or len(canvas_raw) != 2
+                ):
+                    raise ConfigError(
+                        f"templates.{key}.canvas: нужен [ширина, высота]"
+                    )
+                canvas = (int(canvas_raw[0]), int(canvas_raw[1]))
+                if canvas[0] < 200 or canvas[1] < 200:
+                    raise ConfigError(
+                        f"templates.{key}.canvas: слишком маленький холст {canvas}"
+                    )
+            except (TypeError, ValueError) as exc:
+                if strict:
+                    raise ConfigError(
+                        f"templates.{key}.canvas: нужен [ширина, высота]"
+                    ) from exc
+                warnings.append(f"templates.{key}.canvas: некорректный холст")
+                canvas = (1240, 1754)
+
+        try:
+            if file_path is not None:
+                width, height = _image_size(file_path)
+            else:
+                width, height = canvas
+            if background is not None and canvas_raw is not None and file_path is None:
+                width, height = canvas
         except ConfigError as exc:
             if strict:
                 raise
@@ -713,12 +960,29 @@ def load_templates(
                 log.error("%s", exc)
                 template_ok = False
                 continue
+            inherit = {
+                key_name: field_raw[key_name]
+                for key_name in STYLE_KEYS
+                if key_name in field_raw
+            }
+            field_date = _parse_dates(
+                field_raw.get("date"),
+                defaults,
+                fonts,
+                limits,
+                f"templates.{key}.fields.{field_key}.date",
+                strict,
+                width=width,
+                height=height,
+                fallback={**inherit, "font_size": 20, "max_lines": 1},
+            )
             fields[field_key] = FieldConfig(
                 key=field_key,
                 label=str(field_raw.get("label", field_key)),
                 box=box,
                 style=style,
                 sample=str(field_raw.get("sample", "")),
+                date=field_date,
             )
 
         if not template_ok or not fields:
@@ -787,6 +1051,18 @@ def load_templates(
             log.error("%s", message)
             continue
 
+        dates = _parse_dates(
+            template_raw.get("dates"),
+            defaults,
+            fonts,
+            limits,
+            f"templates.{key}.dates",
+            strict,
+            width=width,
+            height=height,
+            fallback={"font_size": 30},
+        )
+
         terms: TermsConfig | None = None
         terms_raw = template_raw.get("terms")
         if isinstance(terms_raw, dict) and terms_raw.get("enabled", True) is not False:
@@ -846,6 +1122,10 @@ def load_templates(
                 terms=terms,
                 sort=sort_value,
                 keywords=tuple(str(word) for word in keywords_raw if str(word).strip()),
+                dates=dates,
+                background=background,
+                frame=frame,
+                canvas=canvas if file_path is None else (width, height),
             )
         )
 
@@ -877,18 +1157,29 @@ class ConfigManager:
         self.settings_path = config_dir / "settings.yaml"
         self.texts_path = config_dir / "texts.yaml"
         self.templates_path = config_dir / "templates.yaml"
+        # Бланки, собранные пользователем (свой фон, шрифт, рамка).
+        self.custom_templates_path = config_dir / "custom_templates.yaml"
         self.env_path = env_path
 
         self.settings = load_settings(self.settings_path, self.env_path)
         self.texts = Texts(_read_yaml(self.texts_path), self.texts_path)
-        self.templates = load_templates(self.templates_path, self.settings.limits)
+        self.templates = load_templates(
+            self.templates_path,
+            self.settings.limits,
+            extra_paths=[self.custom_templates_path],
+        )
         self._mtimes = self._stat_all()
         self._last_check = 0.0
         self._reload_callbacks: list[Callable[[], None]] = []
 
     def _stat_all(self) -> dict[Path, int]:
         result: dict[Path, int] = {}
-        for path in (self.settings_path, self.texts_path, self.templates_path):
+        for path in (
+            self.settings_path,
+            self.texts_path,
+            self.templates_path,
+            self.custom_templates_path,
+        ):
             try:
                 result[path] = path.stat().st_mtime_ns
             except OSError:
@@ -915,7 +1206,11 @@ class ConfigManager:
         try:
             new_settings = load_settings(self.settings_path, self.env_path)
             new_texts = Texts(_read_yaml(self.texts_path), self.texts_path)
-            new_templates = load_templates(self.templates_path, new_settings.limits)
+            new_templates = load_templates(
+                self.templates_path,
+                new_settings.limits,
+                extra_paths=[self.custom_templates_path],
+            )
         except Exception as exc:  # noqa: BLE001 - keep the bot alive
             log.error("Не удалось перечитать конфиг, оставляю старый: %s", exc)
             # Remember current mtimes so a broken file is not retried every second.
@@ -982,10 +1277,17 @@ def required_text_keys() -> Iterable[str]:
         "archive.signer_line",
         "archive.no_signers",
         "archive.terms_line",
+        "archive.date_line",
         "archive.terms_author_line",
         "guest.preview_caption",
         "guest.preview_caption_no_description",
         "guest.contract_caption",
+        "guest.date_prompt",
+        "guest.date_set",
+        "guest.date_auto",
+        "guest.date_empty",
+        "guest.date_too_long",
+        "guest.date_does_not_fit",
         "guest.terms_prompt",
         "guest.terms_empty",
         "guest.terms_too_long",
@@ -1028,6 +1330,7 @@ def required_text_keys() -> Iterable[str]:
         "buttons.signed",
         "buttons.dispute",
         "buttons.propose_terms",
+        "buttons.date",
         "buttons.cancel",
         "callback.expired",
         "callback.done",
@@ -1036,6 +1339,7 @@ def required_text_keys() -> Iterable[str]:
         "callback.waiting",
         "callback.terms_first",
         "callback.no_terms",
+        "callback.no_dates",
         "callback.terms_changing",
         "callback.cancelled",
         "callback.not_yours",

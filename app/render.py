@@ -5,15 +5,21 @@ from __future__ import annotations
 import io
 import logging
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import regex
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps
 
 from .config import (
     DEFAULT_FONT,
+    BackgroundConfig,
     Box,
+    DateConfig,
+    DateSettings,
     FieldConfig,
+    FrameConfig,
     Limits,
     RenderSettings,
     TemplateConfig,
@@ -41,12 +47,58 @@ class RenderError(RuntimeError):
 
 _font_cache: dict[tuple[str, int], ImageFont.FreeTypeFont] = {}
 _image_cache: dict[str, tuple[int, Image.Image]] = {}
+_canvas_cache: dict[str, tuple[tuple, Image.Image]] = {}
 
 
 def clear_caches() -> None:
-    """Drop cached fonts and template images (used on config reload)."""
+    """Drop cached fonts, template images and composed canvases."""
     _font_cache.clear()
     _image_cache.clear()
+    _canvas_cache.clear()
+
+
+# ---------------------------------------------------------------------------
+# dates
+# ---------------------------------------------------------------------------
+
+
+def default_date(settings: DateSettings | None = None) -> str:
+    """Сегодняшняя дата в настроенном часовом поясе и формате."""
+    dates = settings or DateSettings()
+    try:
+        zone = ZoneInfo(dates.timezone)
+    except Exception:  # noqa: BLE001
+        log.warning("Неизвестный часовой пояс %r, беру локальное время", dates.timezone)
+        zone = None
+    now = datetime.now(zone) if zone is not None else datetime.now()
+    return now.strftime(dates.format)
+
+
+def format_date(dates: DateConfig, value: str) -> str:
+    """Подставить дату в шаблон блока: ``{date}`` — сама дата."""
+    return dates.fmt.replace("{date}", value).strip()
+
+
+def validate_date(text: str, dates: DateConfig, limits: Limits) -> SignatureCheck:
+    """Проверить ручную дату: не пусто, не длинно, влезает в свой блок."""
+    normalized = normalize_text(text)
+    length = count_graphemes(normalized)
+    max_length = min(dates.style.max_length, limits.signature_hard_cap)
+
+    if not normalized:
+        return SignatureCheck(False, normalized, 0, max_length, "empty")
+    if length > max_length:
+        return SignatureCheck(False, normalized, length, max_length, "too_long")
+
+    layout = layout_text(
+        format_date(dates, normalized),
+        dates.box,
+        dates.style,
+        max_lines=dates.style.max_lines,
+    )
+    if layout is None:
+        return SignatureCheck(False, normalized, length, max_length, "does_not_fit")
+    return SignatureCheck(True, normalized, length, max_length, layout=layout)
 
 
 def _load_font(path: Path, size: int) -> ImageFont.FreeTypeFont:
@@ -90,6 +142,132 @@ def load_template_image(path: Path) -> Image.Image:
 
     _image_cache[str(path)] = (mtime, image.copy())
     return image
+
+
+def _path_stamp(path: Path | None) -> tuple[str, int, int]:
+    if path is None:
+        return ("", 0, 0)
+    try:
+        stat = path.stat()
+    except OSError:
+        return (str(path), 0, 0)
+    return (str(path), stat.st_mtime_ns, stat.st_size)
+
+
+def _fit_background(size: tuple[int, int], background: BackgroundConfig) -> Image.Image:
+    """Вписать картинку фона в холст: cover, contain или stretch."""
+    try:
+        with Image.open(background.image) as opened:
+            opened.load()
+            source = opened.convert("RGB")
+    except Exception as exc:  # noqa: BLE001
+        raise RenderError(f"Не удалось открыть фон {background.image}: {exc}") from exc
+
+    if background.blur > 0:
+        source = source.filter(ImageFilter.GaussianBlur(background.blur))
+
+    if background.fit == "stretch":
+        fitted = source.resize(size, Image.LANCZOS)
+    elif background.fit == "contain":
+        fitted = ImageOps.pad(source, size, method=Image.LANCZOS, color=(255, 255, 255))
+    else:  # cover — заполнить холст целиком, лишнее обрезать
+        fitted = ImageOps.fit(source, size, method=Image.LANCZOS)
+
+    if background.dim > 0:
+        black = Image.new("RGB", size, (0, 0, 0))
+        fitted = Image.blend(fitted, black, min(0.95, background.dim))
+    return fitted
+
+
+def _draw_frame(canvas: Image.Image, frame: FrameConfig) -> None:
+    """Рамка поверх фона: картинка-оверлей или нарисованные линии."""
+    width, height = canvas.size
+    if frame.image is not None:
+        try:
+            with Image.open(frame.image) as opened:
+                opened.load()
+                overlay = opened.convert("RGBA")
+        except Exception as exc:  # noqa: BLE001
+            raise RenderError(f"Не удалось открыть рамку {frame.image}: {exc}") from exc
+        if overlay.size != canvas.size:
+            overlay = overlay.resize((width, height), Image.LANCZOS)
+        canvas.paste(overlay, (0, 0), overlay)
+        return
+
+    draw = ImageDraw.Draw(canvas)
+    inset = max(0, min(frame.inset, min(width, height) // 2 - 2))
+    width_line = max(1, min(frame.width, min(width, height) // 4))
+    radius = max(0, min(frame.radius, min(width, height) // 2 - inset))
+    box = [inset, inset, width - inset, height - inset]
+    if radius:
+        draw.rounded_rectangle(box, radius=radius, outline=frame.color, width=width_line)
+    else:
+        draw.rectangle(box, outline=frame.color, width=width_line)
+
+    if frame.double:
+        gap = max(1, frame.gap)
+        inner = [inset + gap + width_line, inset + gap + width_line,
+                 width - inset - gap - width_line, height - inset - gap - width_line]
+        if inner[0] < inner[2] and inner[1] < inner[3]:
+            inner_radius = max(0, radius - gap)
+            if inner_radius:
+                draw.rounded_rectangle(
+                    inner, radius=inner_radius, outline=frame.color, width=max(1, width_line // 2)
+                )
+            else:
+                draw.rectangle(
+                    inner, outline=frame.color, width=max(1, width_line // 2)
+                )
+
+    if frame.corners:
+        length = max(24, min(120, frame.inset))
+        thick = width_line + max(1, width_line // 2)
+        for x, y, dx, dy in (
+            (inset, inset, 1, 1),
+            (width - inset, inset, -1, 1),
+            (inset, height - inset, 1, -1),
+            (width - inset, height - inset, -1, -1),
+        ):
+            draw.line([(x, y), (x + dx * length, y)], fill=frame.color, width=thick)
+            draw.line([(x, y), (x, y + dy * length)], fill=frame.color, width=thick)
+
+
+def build_canvas(template: TemplateConfig) -> Image.Image:
+    """Собрать бланк: готовый файл или холст с фоном и рамкой.
+
+    Результат кэшируется по mtime всех файлов и настройкам, а наружу отдаётся
+    копия: рисование подписей не должно портить кэш.
+    """
+    background = template.background
+    frame = template.frame
+    fingerprint = (
+        _path_stamp(template.file),
+        _path_stamp(background.image if background else None),
+        _path_stamp(frame.image if frame else None),
+        repr(background),
+        repr(frame),
+        tuple(template.canvas),
+    )
+    cached = _canvas_cache.get(template.key)
+    if cached is not None and cached[0] == fingerprint:
+        return cached[1].copy()
+
+    if template.file is not None:
+        canvas = load_template_image(template.file)
+        if background is not None:
+            log.warning(
+                "Бланк %s: background не применяется к готовому файлу", template.key
+            )
+    else:
+        if background is None:
+            raise RenderError(f"Бланк {template.key}: нет ни file, ни background")
+        canvas = _fit_background(tuple(template.canvas), background)
+
+    if frame is not None:
+        _draw_frame(canvas, frame)
+
+    _canvas_cache[template.key] = (fingerprint, canvas.copy())
+    return canvas
 
 
 # ---------------------------------------------------------------------------
@@ -404,12 +582,39 @@ def render_contract(
     *,
     self_sign_note: str | None = None,
     terms: str | None = None,
+    date: str | None = None,
     settings: RenderSettings | None = None,
 ) -> bytes:
-    """Draw terms, signatures and the optional note; return a JPEG."""
+    """Draw terms, date, signatures and the optional note; return a JPEG."""
     settings = settings or RenderSettings()
-    image = load_template_image(template.file)
+    image = build_canvas(template)
     draw = ImageDraw.Draw(image)
+
+    date_blocks: list[tuple[DateConfig, str]] = []
+    if date and template.dates is not None:
+        date_blocks.append((template.dates, date))
+    if date:
+        date_blocks.extend(
+            (field.date, date)
+            for field in template.fields.values()
+            if field.date is not None
+        )
+    for dates, value in date_blocks:
+        text = format_date(dates, value)
+        layout = layout_text(
+            text, dates.box, dates.style, max_lines=dates.style.max_lines
+        )
+        if layout is None:
+            log.warning("Дата не помещается в блок %s", template.key)
+            continue
+        draw_layout(
+            draw,
+            layout,
+            dates.box,
+            dates.style.color,
+            dates.style.align,
+            dates.style.valign,
+        )
 
     if terms and template.terms is not None:
         layout = layout_text(
@@ -497,6 +702,30 @@ def debug_image(template: TemplateConfig, *, draw_samples: bool = True) -> Image
 
     if template.note is not None:
         mark(template.note.box, "self_sign_note", (30, 80, 200))
+
+    if template.dates is not None:
+        mark(template.dates.box, "dates", (220, 120, 20))
+        if draw_samples:
+            sample = format_date(template.dates, "18.10.2026")
+            layout = layout_text(
+                sample,
+                template.dates.box,
+                template.dates.style,
+                max_lines=template.dates.style.max_lines,
+            )
+            if layout is not None:
+                draw_layout(
+                    draw,
+                    layout,
+                    template.dates.box,
+                    (220, 120, 20),
+                    template.dates.style.align,
+                    template.dates.style.valign,
+                )
+
+    for field_key, field in template.fields.items():
+        if field.date is not None:
+            mark(field.date.box, f"{field_key}.date", (220, 120, 20))
 
     if template.terms is not None:
         mark(template.terms.box, "terms", (150, 40, 150))

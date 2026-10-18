@@ -151,12 +151,15 @@ class App:
         lines: list[str] = []
         for contract in self.store.contracts():
             pending = len(self.store.pending_for_contract(contract.token))
+            pending += len(self.store.pending_terms_for_contract(contract.token))
             signed = ",".join(contract.signatures) or "-"
             inline = (contract.inline_message_id or "-")[:20]
+            revisions = len(contract.terms_revisions) + (1 if contract.terms else 0)
             lines.append(
                 f"{contract.token} {contract.state} chat={contract.chat_key or '-'} "
                 f"tmpl={contract.template_key} inline={inline} "
-                f"msg={contract.message_id or '-'} signed={signed} pending={pending}"
+                f"msg={contract.message_id or '-'} signed={signed} pending={pending} "
+                f"terms={revisions} author={contract.terms_author_id or '-'}"
             )
         return lines
 
@@ -296,12 +299,8 @@ class App:
                 message,
                 contract,
                 template,
-                ui.contract_caption(
-                    self.config, template, self.max_length_for(template)
-                ),
-                ui.signed_buttons_markup(
-                    self.config, contract.token, template, set(contract.signatures)
-                ),
+                self.contract_caption(contract, template),
+                self.signed_markup(contract, template),
                 file_id=file_id,
             )
         elif contract.state == STATE_TERMS and template.terms is not None:
@@ -361,6 +360,36 @@ class App:
             )
         except Exception as exc:  # noqa: BLE001
             log.info("Не удалось пометить старый бланк: %s", exc)
+
+    # -- blank captions and buttons ---------------------------------------
+
+    def can_dispute(self, contract: Contract, template: TemplateConfig) -> bool:
+        """Оспорить можно только уже напечатанные свободные условия."""
+        return (
+            template.terms is not None
+            and bool(contract.terms)
+            and contract.state != STATE_SIGNED
+        )
+
+    def contract_caption(self, contract: Contract, template: TemplateConfig) -> str:
+        return ui.contract_caption(
+            self.config,
+            template,
+            self.max_length_for(template),
+            terms=contract.terms,
+            author=contract.terms_author_name,
+        )
+
+    def signed_markup(
+        self, contract: Contract, template: TemplateConfig
+    ) -> InlineKeyboardMarkup:
+        return ui.signed_buttons_markup(
+            self.config,
+            contract.token,
+            template,
+            set(contract.signatures),
+            dispute=self.can_dispute(contract, template),
+        )
 
     async def send_preview(
         self, message: Message, contract: Contract, template: TemplateConfig
@@ -439,12 +468,8 @@ class App:
         return await self.edit_contract(
             contract,
             template,
-            ui.contract_caption(
-                self.config, template, self.max_length_for(template)
-            ),
-            ui.signed_buttons_markup(
-                self.config, contract.token, template, set(contract.signatures)
-            ),
+            self.contract_caption(contract, template),
+            self.signed_markup(contract, template),
         )
 
     # -- editing ----------------------------------------------------------
@@ -523,13 +548,16 @@ class App:
             contract,
             template,
             ui.sign_prompt_caption(
-                self.config, field, user_name, self.max_length_for(template)
+                self.config,
+                field,
+                user_name,
+                self.max_length_for(template),
+                terms=contract.terms,
+                author=contract.terms_author_name,
             ),
             # Уже подписанные стороны остаются с галочкой: иначе второму
             # участнику кажется, что прогресс сбросился.
-            ui.signed_buttons_markup(
-                self.config, contract.token, template, set(contract.signatures)
-            ),
+            self.signed_markup(contract, template),
         )
 
     async def show_signed_progress(
@@ -543,8 +571,33 @@ class App:
             label=html.escape(field.label if field else field_key),
             remaining=html.escape(", ".join(remaining)),
         )
-        markup = ui.signed_buttons_markup(self.config, contract.token, template, signed)
+        caption = ui.with_terms(
+            self.config, caption, contract.terms, author=contract.terms_author_name
+        )
+        markup = self.signed_markup(contract, template)
         return await self.edit_contract(contract, template, caption, markup)
+
+    async def show_dispute_prompt(
+        self,
+        contract: Contract,
+        template: TemplateConfig,
+        user_name: str | None,
+    ) -> bool:
+        """Попросить человека прислать свою редакцию условий."""
+        contract.touch()
+        return await self.edit_contract(
+            contract,
+            template,
+            ui.dispute_prompt(
+                self.config,
+                template,
+                user_name,
+                template.terms_max_length,
+                terms=contract.terms,
+                contract_author=contract.terms_author_name,
+            ),
+            ui.dispute_markup(self.config, contract.token),
+        )
 
     async def mark_expired(self, contract: Contract) -> None:
         template = self.template_or_first(contract.template_key)
@@ -564,12 +617,8 @@ class App:
             await self.edit_contract(
                 contract,
                 template,
-                ui.contract_caption(
-                    self.config, template, self.max_length_for(template)
-                ),
-                ui.signed_buttons_markup(
-                    self.config, contract.token, template, set(contract.signatures)
-                ),
+                self.contract_caption(contract, template),
+                self.signed_markup(contract, template),
             )
 
     # -- finishing ---------------------------------------------------------
@@ -605,6 +654,8 @@ class App:
             template,
             self_signed,
             note or "",
+            terms=contract.terms,
+            author=contract.terms_author_name,
         )
         if not contract.has_message:
             log.warning("Контракт %s подписан, но сообщение уже недоступно", contract.token)

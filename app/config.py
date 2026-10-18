@@ -112,11 +112,11 @@ def _mapping(value: Any, name: str) -> dict[str, Any]:
     return value
 
 
-class _SafeDict(dict[str, Any]):
-    """``format_map`` helper: missing keys stay visible instead of crashing."""
-
-    def __missing__(self, key: str) -> str:  # noqa: D105
-        return "{" + key + "}"
+# Плейсхолдеры — только простые имена: ``{bot}``, ``{max_length}``.
+# Пользовательский текст (условия, подписи, имена) может содержать любые
+# фигурные скобки, поэтому подставляем одним проходом, а не ``str.format``:
+# так скобки в значениях остаются как есть и ничего не падает.
+_PLACEHOLDER = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
 
 # ---------------------------------------------------------------------------
@@ -299,11 +299,10 @@ class Texts:
             value = "\n".join(str(item) for item in value)
         elif not isinstance(value, str):
             value = str(value)
-        try:
-            return value.format_map(_SafeDict(kwargs))
-        except (KeyError, ValueError, IndexError) as exc:
-            log.warning("Не удалось подставить плейсхолдеры в %r: %s", key, exc)
-            return value
+        return _PLACEHOLDER.sub(
+            lambda match: str(kwargs.get(match.group(1), match.group(0))),
+            value,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -983,6 +982,7 @@ def required_text_keys() -> Iterable[str]:
         "archive.signer_line",
         "archive.no_signers",
         "archive.terms_line",
+        "archive.terms_author_line",
         "guest.preview_caption",
         "guest.preview_caption_no_description",
         "guest.contract_caption",
@@ -991,6 +991,12 @@ def required_text_keys() -> Iterable[str]:
         "guest.terms_too_long",
         "guest.terms_does_not_fit",
         "guest.terms_not_yours",
+        "guest.terms_author",
+        "guest.dispute_prompt",
+        "guest.terms_disputed",
+        "guest.terms_edited",
+        "guest.terms_signatures_reset",
+        "guest.terms_ready",
         "guest.sign_prompt",
         "guest.sign_prompt_anonymous",
         "guest.one_signed",
@@ -1020,6 +1026,7 @@ def required_text_keys() -> Iterable[str]:
         "buttons.pick",
         "buttons.sign",
         "buttons.signed",
+        "buttons.dispute",
         "buttons.cancel",
         "callback.expired",
         "callback.done",
@@ -1027,6 +1034,8 @@ def required_text_keys() -> Iterable[str]:
         "callback.already_signed",
         "callback.waiting",
         "callback.terms_first",
+        "callback.no_terms",
+        "callback.terms_changing",
         "callback.cancelled",
         "callback.not_yours",
         "errors.generic",

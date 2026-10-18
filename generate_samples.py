@@ -34,7 +34,7 @@ from app.render import (
     build_canvas,
     count_graphemes,
     debug_image,
-    default_date,
+    moment_text,
     format_date,
     layout_text,
     render_contract,
@@ -384,10 +384,7 @@ def load_everything(templates_path: Path, texts_path: Path):
         min_font_scale=float((settings_raw.get("limits") or {}).get("min_font_scale", 0.6)),
     )
     dates_raw = settings_raw.get("dates") or {}
-    dates = DateSettings(
-        timezone=str(dates_raw.get("timezone", "Europe/Moscow")),
-        format=str(dates_raw.get("format", "%d.%m.%Y")),
-    )
+    dates = DateSettings(format=str(dates_raw.get("format", "%d.%m.%Y")))
     warnings: list[str] = []
     custom_path = templates_path.parent / "custom_templates.yaml"
     extra_paths = [custom_path] if custom_path.exists() else []
@@ -699,7 +696,7 @@ def cmd_render(args: argparse.Namespace) -> int:
                     signatures,
                     self_sign_note=note if mode == "self_signed" else None,
                     terms=TERMS_SAMPLE if template.terms is not None else None,
-                    date=default_date(dates),
+                    date=moment_text(None, dates),
                     settings=render_settings,
                     stamped=mode == "stamped",
                 )

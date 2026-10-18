@@ -25,7 +25,7 @@ from aiogram.types import (
 
 from . import ui
 from .config import ConfigManager, TemplateConfig
-from .render import RenderError, clear_caches, default_date, render_contract
+from .render import RenderError, clear_caches, moment_text, render_contract
 from .storage import TemplateStorage
 from .store import (
     STATE_OPEN,
@@ -208,8 +208,12 @@ class App:
     # -- dates -----------------------------------------------------------
 
     def contract_date(self, contract: Contract) -> str:
-        """Дата на бланке: ручная, если её вписали, иначе сегодняшняя."""
-        return contract.date_text or default_date(self.settings.dates)
+        """Дата на бланке: ручная, иначе та, что пришла в сообщении."""
+        return (
+            contract.date_text
+            or contract.date_default
+            or moment_text(None, self.settings.dates)
+        )
 
     def date_max_length(self, template: TemplateConfig) -> int:
         rule = template.date_rule
@@ -263,7 +267,6 @@ class App:
                     self.bot,
                     data,
                     f"Бланк: {html.escape(template.title)}",
-                    key=template.key,
                 )
             except Exception:  # noqa: BLE001
                 log.exception("Не удалось нарисовать бланк %s с датой", template.key)
@@ -336,7 +339,7 @@ class App:
             if not inline_id:
                 log.warning("Guest-ответ пришёл без inline_message_id")
                 return False
-            # bind_inline снимает старую привязку: карточка переехала.
+            # Карточка переехала в новое guest-сообщение.
             self.store.bind_inline(contract, inline_id)
             return True
 
@@ -453,7 +456,6 @@ class App:
             target["message_id"] = message_id
         else:
             return
-        self.store.unbind_inline(inline_message_id)
         try:
             await self.bot.edit_message_caption(
                 caption=self.config.text("guest.continued"),
@@ -776,10 +778,7 @@ class App:
 
     async def confirm_seal_date(self, contract: Contract, template: TemplateConfig) -> bool:
         """Создатель подтвердил дату: фиксируем её и показываем кнопку печати."""
-        if contract.date_auto:
-            # Автоматическая дата — это «сегодня на момент подписания»,
-            # а не дата вызова бота: подписывать могли и через сутки.
-            contract.date_text = default_date(self.settings.dates)
+        contract.date_text = self.contract_date(contract)
         contract.date_confirmed = True
         contract.touch()
         if template.stamp_rule is None:
@@ -821,7 +820,6 @@ class App:
         template: TemplateConfig,
         *,
         stamp: bool = False,
-        user_id: int = 0,
     ) -> bool:
         """Собрать готовый контракт.
 
@@ -890,7 +888,7 @@ class App:
         # "уже подписан" instead of silently starting a new one. Only signature
         # text is stored — the image is rendered on demand.
         if stamp:
-            self.store.mark_stamped(contract, user_id)
+            self.store.mark_stamped(contract)
         else:
             contract.state = STATE_SIGNED
             contract.touch()

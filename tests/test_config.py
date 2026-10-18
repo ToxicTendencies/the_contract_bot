@@ -185,9 +185,9 @@ def test_dates_are_parsed_for_every_template(config):
         assert dates.box.bottom <= template.canvas[1]
 
 
-def test_settings_dates_defaults(config):
-    assert config.settings.dates.timezone == "Europe/Moscow"
+def test_settings_dates_keep_only_format(config):
     assert config.settings.dates.format == "%d.%m.%Y"
+    assert not hasattr(config.settings.dates, "timezone")
 
 
 def test_custom_template_with_background_and_frame(tmp_path: Path):
@@ -403,19 +403,21 @@ templates:
         load_templates(extra_paths=[source], strict=True)
 
 
-def test_unknown_timezone_is_rejected(tmp_path: Path, monkeypatch):
+def test_leftover_timezone_is_ignored(tmp_path: Path, monkeypatch):
+    """Старый settings.yaml с timezone грузится: ключ просто не читается."""
     config_dir = copy_config(tmp_path)
     monkeypatch.setenv("BOT_TOKEN", "123:TEST")
     monkeypatch.setenv("OWNER_ID", "42")
     path = config_dir / "settings.yaml"
     path.write_text(
         path.read_text(encoding="utf-8").replace(
-            "timezone: Europe/Moscow", "timezone: Mars/Olympus"
+            "  format: \"%d.%m.%Y\"",
+            "  timezone: Mars/Olympus\n  format: \"%d.%m.%Y\"",
         ),
         encoding="utf-8",
     )
-    with pytest.raises(ConfigError):
-        load_settings(path)
+    settings = load_settings(path)
+    assert settings.dates.format == "%d.%m.%Y"
 
 
 # ---------------------------------------------------------------------------

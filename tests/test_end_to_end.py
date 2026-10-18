@@ -8,11 +8,12 @@ from __future__ import annotations
 
 import itertools
 import types
+from datetime import datetime, timezone
 
 import pytest
 
 from app.handlers import handle_callback, handle_chat_message
-from app.render import default_date, render_contract
+from app.render import moment_text, render_contract
 from app.store import STATE_OPEN, STATE_PREVIEW, STATE_SEAL, STATE_SIGNED, STATE_TERMS
 
 from .helpers import FakeCallback, FakeChat, FakeUser
@@ -53,10 +54,10 @@ class FakeStorage:
     def is_ready(self, key: str) -> bool:
         return True
 
-    async def preview_image(self, bot, data: bytes, caption: str, *, key="", filename="blank.jpg"):
+    async def preview_image(self, bot, data: bytes, caption: str, *, filename="blank.jpg"):
         # Превью с датой не тратит «настоящую» загрузку: тесты считают
         # загрузки картинок с условиями, и их номера должны быть стабильны.
-        return f"file-{key}"
+        return "file-blank"
 
     async def upload_image(self, bot, data: bytes, caption: str, *, filename="blank.jpg"):
         self.uploads.append({"data": data, "caption": caption})
@@ -192,7 +193,7 @@ async def test_full_chat_flow(wired):
     preview = photo_result(summon)
     contract = app.store.for_chat("g-100500")
     assert contract is not None
-    assert preview.photo_file_id == "file-classic"
+    assert preview.photo_file_id == "file-blank"
     assert contract.inline_message_id.startswith("guest-")
 
     # 2. «Выбрать» превращает превью в контракт с кнопками сторон
@@ -225,7 +226,7 @@ async def test_full_chat_flow(wired):
     # 6. Все подписали, но контракт ещё не готов: создатель подтверждает дату
     assert contract.state == STATE_SEAL
     seal_card = bot.edits[-1]
-    assert seal_card["media"].media == "file-classic"
+    assert seal_card["media"].media == "file-blank"
     seal_keys = [
         button.callback_data
         for row in seal_card["reply_markup"].inline_keyboard
@@ -522,7 +523,7 @@ async def test_member_mode_keeps_everything_in_chat(wired):
     assert summon.photos, "бот должен прислать бланк обычным сообщением"
     assert contract.chat_id == -100777
     assert contract.message_id == 900
-    assert summon.photos[0]["photo"] == "file-classic"
+    assert summon.photos[0]["photo"] == "file-blank"
 
     # Выбор бланка и подпись — всё по message_id, без inline_message_id
     pick = await press(app, f"pk:{contract.token}:0", anna)
@@ -1413,6 +1414,11 @@ def _keys(result) -> list[str]:
     return [button.callback_data for row in _rows(result.reply_markup) for button in row]
 
 
+def _now_text(app) -> str:
+    """Дата «сейчас» в том же виде, в каком её печатает бот."""
+    return moment_text(None, app.settings.dates)
+
+
 async def _signed_contract(app, creator, mate, chat=None, template_key="classic"):
     """Контракт с двумя подписями: дальше только дата и печать."""
     summon = FakeGuestMessage("@test_bot", creator, chat)
@@ -1429,19 +1435,18 @@ async def _signed_contract(app, creator, mate, chat=None, template_key="classic"
 
 
 @pytest.mark.asyncio
-async def test_date_is_automatic_and_confirmed_after_signatures(wired):
+async def test_date_comes_from_message_and_is_confirmed_after_signatures(wired):
     app, bot, storage = wired
     anna = FakeUser(10, first_name="Аня")
     boris = FakeUser(20, first_name="Борис")
-    today = default_date(app.settings.dates)
+    today = _now_text(app)
 
     summon = FakeGuestMessage("@test_bot", anna)
     await handle_chat_message(app, summon)
     contract = app.store.for_chat("g-100500")
     assert contract.date_text == today
-    assert contract.date_auto is True
 
-    # До подписей кнопки даты нет: дата ставится автоматически.
+    # До подписей кнопки даты нет: дата уже стоит из сообщения.
     assert all(not key.startswith(("dt:", "slc:", "sl:")) for key in _keys(summon.answers[-1]))
     await press(app, f"pk:{contract.token}:0", anna, contract.inline_message_id)
     contract_keys = [
@@ -1472,8 +1477,6 @@ async def test_date_is_automatic_and_confirmed_after_signatures(wired):
     reply = reply_to_bot("01.02.2027", anna, contract, query_id="date1")
     await handle_chat_message(app, reply)
     assert contract.date_text == "01.02.2027"
-    assert contract.date_auto is False
-    assert contract.date_user_id == anna.id
     assert contract.date_confirmed is False
     assert "01.02.2027" in reply.answers[-1].input_message_content.message_text
 
@@ -1489,7 +1492,6 @@ async def test_date_is_automatic_and_confirmed_after_signatures(wired):
 
     await press(app, f"sl:{contract.token}", anna, contract.inline_message_id)
     assert contract.state == STATE_SIGNED
-    assert contract.stamp_user_id == anna.id
     assert contract.is_stamped
 
     template = app.config.templates.get("classic")
@@ -1509,21 +1511,21 @@ async def test_auto_date_returns_with_word_auto(wired):
     app, _bot, _storage = wired
     anna = FakeUser(10, first_name="Аня")
     boris = FakeUser(20, first_name="Борис")
-    today = default_date(app.settings.dates)
+    today = _now_text(app)
     contract = await _signed_contract(app, anna, boris)
+    original = contract.date_text
 
     await press(app, f"dt:{contract.token}", anna, contract.inline_message_id)
     reply = reply_to_bot("05.05.2030", anna, contract, query_id="date2")
     await handle_chat_message(app, reply)
-    assert contract.date_auto is False
+    assert contract.date_text == "05.05.2030"
 
     await press(app, f"dt:{contract.token}", anna, contract.inline_message_id)
     reset = reply_to_bot("авто", anna, contract, query_id="date3")
     await handle_chat_message(app, reset)
-    assert contract.date_auto is True
-    assert contract.date_text == today
-    assert contract.date_user_id == 0
-    assert today in reset.answers[-1].input_message_content.message_text
+    assert contract.date_text == original
+    assert original in reset.answers[-1].input_message_content.message_text
+    assert contract.date_default == today
 
 
 @pytest.mark.asyncio
@@ -1538,7 +1540,6 @@ async def test_bad_date_is_rejected_without_changing_contract(wired):
     reply = reply_to_bot("1" * 80, anna, contract, query_id="date4")
     await handle_chat_message(app, reply)
     assert contract.date_text == before
-    assert contract.date_auto is True
     answer = reply.answers[-1].input_message_content.message_text
     assert "длинн" in answer or "Слишком" in answer
 
@@ -1704,7 +1705,6 @@ async def test_private_chat_date_edit(wired):
     reply = reply_to_bot("03.03.2030", anna, contract, chat=anna_chat, query_id="date7")
     await handle_chat_message(app, reply)
     assert contract.date_text == "03.03.2030"
-    assert contract.date_user_id == anna.id
 
 
 @pytest.mark.asyncio
@@ -1763,9 +1763,9 @@ async def test_dated_blank_is_uploaded_once_per_date(wired):
     calls: list[str] = []
     original = storage.preview_image
 
-    async def preview_image(bot, data, caption, *, key="", filename="blank.jpg"):
-        calls.append(key)
-        return await original(bot, data, caption, key=key, filename=filename)
+    async def preview_image(bot, data, caption, *, filename="blank.jpg"):
+        calls.append(caption)
+        return await original(bot, data, caption, filename=filename)
 
     storage.preview_image = preview_image
     template = app.config.templates.get("classic")
@@ -1774,24 +1774,40 @@ async def test_dated_blank_is_uploaded_once_per_date(wired):
     second = app.store.create(template_key="classic", date_text="01.02.2027")
     other = app.store.create(template_key="classic", date_text="02.02.2027")
 
-    assert await app.blank_file_id(first, template) == "file-classic"
-    assert await app.blank_file_id(second, template) == "file-classic"
-    assert await app.blank_file_id(other, template) == "file-classic"
-    assert calls == ["classic", "classic"]
+    assert await app.blank_file_id(first, template) == "file-blank"
+    assert await app.blank_file_id(second, template) == "file-blank"
+    assert await app.blank_file_id(other, template) == "file-blank"
+    assert calls == [f"Бланк: {template.title}"] * 2
 
 
 @pytest.mark.asyncio
-async def test_auto_date_is_refreshed_on_confirmation(wired):
-    """Автоматическая дата фиксируется на момент подтверждения, а не вызова."""
+async def test_date_comes_from_the_summon_message(wired):
+    """Дата — момент отправки сообщения, которым вызвали бота, а не «сейчас»."""
     app, _bot, _storage = wired
     anna = FakeUser(10, first_name="Аня")
     boris = FakeUser(20, first_name="Борис")
-    contract = await _signed_contract(app, anna, boris)
 
-    contract.date_text = "01.01.2020"  # как будто подписывали давно
-    assert contract.date_auto is True
+    summon = FakeGuestMessage("@test_bot", anna)
+    summon.date = datetime(2026, 1, 2, 0, 30)  # новогодняя ночь по местному
+    await handle_chat_message(app, summon)
+    contract = app.store.for_chat("g-100500")
+    assert contract.date_text == "02.01.2026"
+
+    await press(app, f"pk:{contract.token}:0", anna, contract.inline_message_id)
+    for user, field in ((anna, "party1"), (boris, "party2")):
+        await press(app, f"sg:{contract.token}:classic:{field}", user, contract.inline_message_id)
+        await handle_chat_message(app, reply_to_bot("подп.", user, contract))
+
     await press(app, f"slc:{contract.token}", anna, contract.inline_message_id)
-    assert contract.date_text == default_date(app.settings.dates)
+    assert contract.date_text == "02.01.2026", "подтверждение не подменяет дату"
+
+    # Telegram присылает время в UTC: берём то же мгновение по часам машины.
+    other_chat = FakeChat(-100777)
+    late = FakeGuestMessage("@test_bot", anna, other_chat)
+    late.date = datetime(2026, 1, 1, 21, 30, tzinfo=timezone.utc)
+    expected = late.date.astimezone().strftime(app.settings.dates.format)
+    await handle_chat_message(app, late)
+    assert app.store.for_chat("g-100777").date_text == expected
 
 
 @pytest.mark.asyncio

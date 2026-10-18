@@ -9,7 +9,6 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from zoneinfo import ZoneInfo
 
 import regex
 from PIL import Image, ImageColor, ImageDraw, ImageFilter, ImageFont, ImageOps
@@ -68,16 +67,18 @@ def clear_caches() -> None:
 # ---------------------------------------------------------------------------
 
 
-def default_date(settings: DateSettings | None = None) -> str:
-    """Сегодняшняя дата в настроенном часовом поясе и формате."""
+def moment_text(moment: datetime | None, settings: DateSettings | None = None) -> str:
+    """Дата момента в локальном времени машины.
+
+    Telegram присылает время сообщения в UTC — переводим его в часы той
+    машины, где запущен бот. Никаких часовых поясов в настройках нет:
+    ``None`` значит «сейчас», это для образцов и запасного варианта.
+    """
     dates = settings or DateSettings()
-    try:
-        zone = ZoneInfo(dates.timezone)
-    except Exception:  # noqa: BLE001
-        log.warning("Неизвестный часовой пояс %r, беру локальное время", dates.timezone)
-        zone = None
-    now = datetime.now(zone) if zone is not None else datetime.now()
-    return now.strftime(dates.format)
+    moment = moment or datetime.now()
+    if moment.tzinfo is not None:
+        moment = moment.astimezone()
+    return moment.strftime(dates.format)
 
 
 def format_date(dates: DateConfig, value: str) -> str:

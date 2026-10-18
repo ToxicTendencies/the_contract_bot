@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+from datetime import datetime, timezone
 from pathlib import Path
 
 from PIL import Image, ImageChops
@@ -10,7 +11,7 @@ from app.render import (
     build_canvas,
     count_graphemes,
     debug_image,
-    default_date,
+    moment_text,
     draw_stamp,
     format_date,
     layout_text,
@@ -225,10 +226,24 @@ def test_render_draws_date(config):
     assert manual.tobytes() != dated.tobytes()
 
 
-def test_default_date_uses_settings(config):
-    value = default_date(config.settings.dates)
-    assert len(value) == len("18.10.2026")
+def test_moment_text_formats_the_moment(config):
+    moment = datetime(2026, 10, 18, 23, 30)
+    value = moment_text(moment, config.settings.dates)
+    assert value == "18.10.2026"
     assert format_date(config.templates.get("classic").dates, value) == f"Дата: {value}"
+
+
+def test_moment_text_converts_utc_to_local(config):
+    """Telegram присылает время в UTC: печатаем по часам машины."""
+    moment = datetime(2026, 10, 18, 21, 30, tzinfo=timezone.utc)
+    expected = moment.astimezone().strftime(config.settings.dates.format)
+    assert moment_text(moment, config.settings.dates) == expected
+
+
+def test_moment_text_without_moment_is_today(config):
+    assert moment_text(None, config.settings.dates) == datetime.now().strftime(
+        config.settings.dates.format
+    )
 
 
 def test_custom_canvas_uses_background_and_frame(tmp_path):

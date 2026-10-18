@@ -106,10 +106,6 @@ class TemplateStorage:
             return template.background is not None
         return self.file_id(template_key) is not None
 
-    def forget(self, template_key: str) -> None:
-        if self._cache.pop(template_key, None) is not None:
-            self._save()
-
     # -- uploads ---------------------------------------------------------
 
     async def warmup(self, bot: Bot) -> tuple[int, int]:
@@ -154,7 +150,6 @@ class TemplateStorage:
         data: bytes,
         caption: str,
         *,
-        key: str = "",
         filename: str = "blank.jpg",
     ) -> str:
         """Картинка бланка с датой для превью и обычных карточек.

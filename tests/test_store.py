@@ -277,9 +277,10 @@ def test_create_stores_date_text():
         chat_key="g1", template_key="classic", date_text="01.02.2027"
     )
     assert contract.date_text == "01.02.2027"
-    assert contract.date_auto is True
+    # Дата создания запоминается как «авто»: к ней вернёт слово «авто».
+    assert contract.date_default == "01.02.2027"
     auto = store.create(chat_key="g2", template_key="classic")
-    assert auto.date_text is None and auto.date_auto is True
+    assert auto.date_text is None and auto.date_default == ""
 
 
 def test_pending_date_is_exclusive():
@@ -332,11 +333,10 @@ def test_mark_stamped_completes_contract():
     contract.state = STATE_SEAL
     store.set_pending(20, contract, "party2")
 
-    store.mark_stamped(contract, 10)
+    store.mark_stamped(contract)
 
     assert contract.state == STATE_SIGNED
     assert contract.is_stamped
-    assert contract.stamp_user_id == 10
     assert contract.stamped_at > 0
     assert store.pending_for(20, "g1") is None
 
@@ -348,13 +348,12 @@ def test_reset_signatures_removes_stamp():
     store.set_terms(contract, "условия", author_id=10)
     store.add_signature(contract, field_key="party1", text="Аня", user_id=10)
     contract.state = STATE_SEAL
-    store.mark_stamped(contract, 10)
+    store.mark_stamped(contract)
     contract.state = STATE_SEAL  # как будто оспорили до финала
 
     store.reset_signatures(contract)
 
     assert not contract.is_stamped
-    assert contract.stamp_user_id == 0
     assert contract.date_confirmed is False
     assert contract.state == STATE_OPEN
 

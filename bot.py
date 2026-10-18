@@ -42,12 +42,12 @@ async def run() -> None:
 
     allowed = app.dp.resolve_used_update_types()
     log.info("Подписки на апдейты: %s", ", ".join(sorted(allowed)))
-    if "inline_query" not in allowed:
-        log.error("inline_query не попал в allowed_updates — @бот не покажет бланки")
     if "guest_message" not in allowed:
+        log.error("guest_message нет в allowed_updates — @бот не увидит упоминания")
+    if not app.guest_mode_enabled:
         log.warning(
-            "guest_message не попал в allowed_updates — упоминания без inline "
-            "работать не будут"
+            "Guest Mode выключен: бот ответит только в тех чатах, где он участник. "
+            "Для работы по @упоминанию без добавления включи Guest Mode в @BotFather"
         )
 
     watcher = asyncio.create_task(watch_config(config), name="config-watcher")
@@ -59,30 +59,41 @@ async def run() -> None:
 
 
 async def check() -> int:
-    """Validate the token and guest mode without starting polling."""
+    """Validate the token and Guest Mode without starting polling."""
     config = ConfigManager()
     setup_logging(config.settings.log_level)
     app = App(config)
     try:
         me = await app.bot.me()
-        inline = bool(getattr(me, "supports_inline_queries", False))
         guest = bool(getattr(me, "supports_guest_queries", False))
+        inline = bool(getattr(me, "supports_inline_queries", False))
         print(f"Бот: @{me.username} (id={me.id})")
-        print(f"Inline mode: {'включён' if inline else 'ВЫКЛЮЧЕН — /setinline в @BotFather'}")
-        print(f"Guest Mode: {'включён' if guest else 'выключен (не обязателен)'}")
+        guest_text = (
+            "включён"
+            if guest
+            else "выключен — бот будет работать только в чатах, где он участник"
+        )
+        print(f"Guest Mode: {guest_text}")
+        print(f"Inline mode: {'включён (боту не нужен)' if inline else 'выключен'}")
         print(f"Бланков в конфиге: {len(config.templates)}")
         for template in config.templates.ordered():
-            print(f"  • {template.key}: {template.inline_name} ({len(template.fields)} поля)")
+            terms = (
+                f", условия до {template.terms.style.max_length} символов"
+                if template.terms is not None
+                else ""
+            )
+            print(
+                f"  • {template.key}: {template.title} "
+                f"({len(template.fields)} поля{terms})"
+            )
         print(f"STORAGE_CHAT_ID: {config.settings.storage_chat_id}")
         print(f"OWNER_ID: {config.settings.owner_id}")
-        if not inline:
+        if not guest:
             print(
-                "Без inline-режима @бот не покажет бланки. "
-                "Guest mode тоже выключен — упоминания работать не будут."
-                if not guest
-                else "Inline выключен: останется только guest-сценарий."
+                "Подсказка: чтобы @бот работал в любом чате без добавления, "
+                "включи Guest Mode в @BotFather (Bot Settings → Guest Mode)."
             )
-        return 0 if inline or guest else 1
+        return 0
     finally:
         await app.bot.session.close()
 
@@ -92,7 +103,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--check",
         action="store_true",
-        help="проверить токен и guest mode, не запуская polling",
+        help="проверить токен и Guest Mode, не запуская polling",
     )
     args = parser.parse_args(argv)
     try:

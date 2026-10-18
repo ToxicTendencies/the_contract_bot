@@ -3,12 +3,9 @@
 Nothing here survives a restart on purpose: contracts are ephemeral, and the
 only persistent artefact is the archive of finished images in the owner's chat.
 
-Two entry points share the same Contract:
-
-* inline mode — contract is bound to ``inline_message_id``; signatures are
-  collected in the bot's DM after the user presses a button;
-* guest mode — contract is bound to a chat key; signatures are collected by
-  replying to the bot's message in that chat.
+Everything happens in the chat: a contract is bound to the chat key and to the
+``inline_message_id`` of the bot's guest message, which is what we edit.  A
+signature is collected by replying to that message.
 
 Pending input is tracked per user, so two people can be typing their
 signatures at the same time.
@@ -21,6 +18,7 @@ import time
 from dataclasses import dataclass, field
 
 STATE_PREVIEW = "preview"
+STATE_TERMS = "terms"
 STATE_OPEN = "open"
 STATE_SIGNED = "signed"
 STATE_CLOSED = "closed"
@@ -57,6 +55,10 @@ class Contract:
     inline_message_id: str | None = None
     chat_id: int | None = None
     message_id: int | None = None
+    # Свободные условия и file_id бланка с уже напечатанными условиями.
+    terms: str = ""
+    terms_user_id: int = 0
+    blank_file_id: str | None = None
     initiator_id: int = 0
     initiator_name: str = ""
     state: str = STATE_PREVIEW
@@ -71,6 +73,11 @@ class Contract:
     @property
     def is_complete(self) -> bool:
         return self.state == STATE_SIGNED
+
+    @property
+    def has_message(self) -> bool:
+        """Есть ли за что редактировать: inline-сообщение или сообщение в чате."""
+        return bool(self.inline_message_id or (self.chat_id and self.message_id))
 
     def same_signers(self) -> bool:
         users = {signature.user_id for signature in self.signatures.values()}
@@ -133,6 +140,18 @@ class ContractStore:
             self._pending.pop(user_id, None)
             return None
         return pending
+
+    def terms_for_user(self, user_id: int, chat_key: str) -> Contract | None:
+        """Контракт в этом чате, который ждёт условия от этого пользователя."""
+        for token in reversed(self._chat_tokens.get(chat_key, [])):
+            contract = self._by_token.get(token)
+            if (
+                contract is not None
+                and contract.state == STATE_TERMS
+                and contract.terms_user_id == user_id
+            ):
+                return contract
+        return None
 
     def pending_holder(self, token: str, field_key: str) -> int | None:
         """Who is currently typing a signature for this field, if anyone."""
@@ -228,6 +247,12 @@ class ContractStore:
             self.drop(contract)
 
     # -- pending input ---------------------------------------------------
+
+    def set_terms(self, contract: Contract, text: str) -> None:
+        contract.terms = text
+        contract.state = STATE_OPEN
+        contract.terms_user_id = 0
+        contract.touch()
 
     def set_pending(
         self, user_id: int, contract: Contract, field_key: str

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Offline debugging for blanks and signatures — no token, no Telegram.
 
-    python generate_samples.py --make-blanks     # create 3 demo blanks
+    python generate_samples.py --make-blanks     # create demo blanks
     python generate_samples.py --debug-boxes     # boxes + coordinates on blanks
     python generate_samples.py --check           # validate config
     python generate_samples.py                   # render sample contracts
@@ -72,6 +72,12 @@ DARK_BODY = (
     "Стороны действуют добросовестно, соблюдают конфиденциальность и сроки.",
     "Подпись на бланке подтверждает согласие с условиями без дополнительных "
     "оговорок.",
+)
+
+TERMS_SAMPLE = (
+    "Исполнитель обязуется подготовить и передать Заказчику макет договора "
+    "до 30 ноября, а Заказчик — принять работу и оплатить её в течение "
+    "пяти рабочих дней после приёмки. Правки согласуются в переписке."
 )
 
 BUTTON_CASES = ("default", "long", "self_signed")
@@ -310,11 +316,47 @@ def make_medieval(path: Path, fonts: dict[str, Path], force: bool) -> bool:
     return True
 
 
+def make_free(path: Path, fonts: dict[str, Path], force: bool) -> bool:
+    """Blank with an empty area for free-form terms."""
+    if path.exists() and not force:
+        return False
+    width, height = 1240, 1754
+    ink = "#1b2a4a"
+    muted = "#5c6880"
+    frame = "#d9d2c4"
+    image = Image.new("RGB", (width, height), "#fffdf8")
+    draw = ImageDraw.Draw(image)
+
+    draw.rectangle([56, 56, width - 56, height - 56], outline=ink, width=3)
+    draw.rectangle([70, 70, width - 70, height - 70], outline=ink, width=1)
+
+    _centered(draw, "ДОГОВОР", 140, _font(fonts["display"], 72), ink, width)
+    _centered(draw, "на условиях сторон", 226, _font(fonts["serif"], 32), muted, width)
+    draw.line([(420, 290), (820, 290)], fill=ink, width=2)
+
+    # Область свободных условий: тонкая рамка и заголовок блока.
+    draw.rectangle([90, 352, width - 90, 1068], outline=frame, width=2)
+    draw.text((110, 366), "УСЛОВИЯ", font=_font(fonts["serif"], 24), fill=muted)
+
+    label_font = _font(fonts["serif"], 26)
+    hint_font = _font(fonts["serif"], 20)
+    _centered(draw, "ПОДПИСИ СТОРОН", 1180, _font(fonts["display"], 30), ink, width)
+
+    for x, label in ((78, "Сторона 1"), (662, "Сторона 2")):
+        draw.text((x, 1232), label, font=label_font, fill=muted)
+        draw.line([(x, 1420), (x + 500, 1420)], fill=ink, width=2)
+        draw.text((x, 1432), "подпись", font=hint_font, fill=muted)
+
+    image.save(path)
+    return True
+
+
 BLANK_PAINTERS = {
     "classic": make_classic,
     "minimal": make_minimal,
     "dark": make_dark,
     "medieval": make_medieval,
+    "free": make_free,
 }
 
 
@@ -454,6 +496,13 @@ def cmd_debug(args: argparse.Namespace) -> int:
                 f"font={field.style.font.name} size={field.style.font_size} "
                 f"max={field.style.max_length}"
             )
+        if template.terms is not None:
+            terms = template.terms
+            print(
+                f"    terms: box=[{terms.box.x}, {terms.box.y}, {terms.box.w}, {terms.box.h}] "
+                f"font={terms.style.font.name} size={terms.style.font_size} "
+                f"max={terms.style.max_length} строк={terms.style.max_lines}"
+            )
         if template.note:
             note = template.note
             print(
@@ -507,6 +556,22 @@ def cmd_check(args: argparse.Namespace) -> int:
                 )
         if total < 2:
             print(f"  ! {template.key}: подписантов меньше двух — это допустимо")
+        if template.terms is not None:
+            layout = layout_text(
+                TERMS_SAMPLE,
+                template.terms.box,
+                template.terms.style,
+                max_lines=template.terms.style.max_lines,
+            )
+            if layout is None:
+                problems.append(
+                    f"{template.key}.terms: образец условий не помещается в box"
+                )
+            else:
+                print(
+                    f"    terms: {count_graphemes(TERMS_SAMPLE)} симв. → "
+                    f"кегль {layout.font_size}, строк {len(layout.lines)}"
+                )
         if template.note is not None:
             note_text = self_sign_note(texts)
             if layout_text(note_text, template.note.box, template.note.style) is None:
@@ -549,6 +614,8 @@ def cmd_list(args: argparse.Namespace) -> int:
         print(f"  теги: {', '.join(template.tags) or '—'}")
         print(f"  поля: {', '.join(template.fields) or '—'}")
         print(f"  пометка: {'да' if template.note else 'нет'}")
+        if template.terms is not None:
+            print(f"  условия: до {template.terms.style.max_length} символов, печатаются на бланке")
         print(f"  лимит: {min(f.style.max_length for f in template.fields.values())} символов")
     return 0
 
@@ -575,6 +642,7 @@ def cmd_render(args: argparse.Namespace) -> int:
                     template,
                     signatures,
                     self_sign_note=note if mode == "self_signed" else None,
+                    terms=TERMS_SAMPLE if template.terms is not None else None,
                     settings=render_settings,
                 )
             except RenderError as exc:

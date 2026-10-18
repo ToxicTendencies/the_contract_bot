@@ -95,13 +95,25 @@ def test_find_template():
     assert templates.find("ерунда") is None
 
 
-def test_inline_metadata():
+def test_template_keywords():
     templates = load_templates()
     medieval = templates.get("medieval")
     assert medieval is not None
-    assert medieval.inline_name == "Средневековый контракт"
-    assert "Пергамент" in medieval.inline_hint
+    assert medieval.title == "Средневековый контракт"
     assert "рыцарь" in medieval.keywords
+    assert "пергамент" in medieval.keywords
+
+
+def test_terms_block_is_loaded():
+    templates = load_templates()
+    free = templates.get("free")
+    assert free is not None
+    assert free.has_terms
+    assert free.terms is not None
+    assert free.terms.style.max_length == 700
+    assert free.terms.style.max_lines == 18
+    assert free.terms.box.w == 1020
+    assert templates.get("classic").has_terms is False
 
 
 def test_find_all_ranking():
@@ -111,10 +123,11 @@ def test_find_all_ranking():
         "minimal",
         "dark",
         "medieval",
+        "free",
     ]
     assert [t.key for t in templates.find_all("средневековый")] == ["medieval"]
     assert [t.key for t in templates.find_all("рыцарь")] == ["medieval"]
-    assert [t.key for t in templates.find_all("договор")] == ["classic"]
+    assert [t.key for t in templates.find_all("условия")] == ["free"]
     assert templates.find_all("ерунда") == []
 
 

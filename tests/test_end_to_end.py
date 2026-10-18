@@ -1,4 +1,8 @@
-"""Full inline flow with real App methods and a fake Telegram bot."""
+"""Full chat flow with real App methods and a fake Telegram bot.
+
+No inline mode: the bot is summoned with a mention, replies with a photo right
+in the chat, and every edit happens on that same message.
+"""
 
 from __future__ import annotations
 
@@ -6,8 +10,8 @@ import types
 
 import pytest
 
-from app.handlers import handle_callback, handle_chosen_inline_result, handle_dm, handle_inline_query
-from app.store import STATE_SIGNED
+from app.handlers import handle_callback, handle_chat_message
+from app.store import STATE_OPEN, STATE_SIGNED, STATE_TERMS
 
 from .helpers import FakeCallback, FakeChat, FakeUser
 
@@ -32,33 +36,55 @@ class FakeBot:
 
 
 class FakeStorage:
+    def __init__(self) -> None:
+        self.uploads: list[dict] = []
+        self.archive: list[dict] = []
+
     def file_id(self, key: str):
         return f"file-{key}"
 
     def is_ready(self, key: str) -> bool:
         return True
 
+    async def upload_image(self, bot, data: bytes, caption: str, *, filename="blank.jpg"):
+        self.uploads.append({"data": data, "caption": caption})
+        return f"blank-with-terms-{len(self.uploads)}"
+
     async def upload_signed(self, bot, data: bytes, caption: str) -> str:
-        self.caption = caption
-        self.bytes = data
+        self.archive.append({"data": data, "caption": caption})
         return "signed-file-id"
 
 
-class FakeInlineQuery:
-    def __init__(self, text: str = ""):
-        self.query = text
-        self.from_user = FakeUser(1, first_name="Аня")
-        self.answers: list[dict] = []
-
-    async def answer(self, results, **kwargs):
-        self.answers.append({"results": results, **kwargs})
-
-
-class FakeChosen:
-    def __init__(self, result_id: str, inline_message_id: str):
-        self.result_id = result_id
+class FakeSent:
+    def __init__(self, inline_message_id: str) -> None:
         self.inline_message_id = inline_message_id
-        self.from_user = FakeUser(1, first_name="Аня")
+
+
+class FakeGuestMessage:
+    """A message with a mention (or a reply) delivered by guest mode."""
+
+    def __init__(
+        self,
+        text: str,
+        user: FakeUser,
+        chat: FakeChat | None = None,
+        *,
+        query_id: str = "q1",
+        reply_to: object | None = None,
+    ) -> None:
+        self.text = text
+        self.from_user = user
+        self.chat = chat or FakeChat(-100500)
+        self.guest_query_id = query_id
+        self.guest_bot_caller_user = user
+        self.guest_bot_caller_chat = self.chat
+        self.message_thread_id = None
+        self.reply_to_message = reply_to
+        self.answers: list[object] = []
+
+    async def answer_guest_query(self, *, result):
+        self.answers.append(result)
+        return FakeSent(f"guest-{id(self)}-{len(self.answers)}")
 
 
 class FakeDM:
@@ -82,149 +108,119 @@ def wired(app):
     return app, bot, storage
 
 
-@pytest.mark.asyncio
-async def test_full_inline_flow(wired):
-    app, bot, storage = wired
-
-    # 1. empty query -> carousel with every blank
-    query = FakeInlineQuery("")
-    await handle_inline_query(app, query)
-    results = query.answers[0]["results"]
-    assert len(results) == 4
-
-    # 2. medieval by keyword -> one result
-    medieval_query = FakeInlineQuery("рыцарь")
-    await handle_inline_query(app, medieval_query)
-    medieval_results = medieval_query.answers[0]["results"]
-    assert len(medieval_results) == 1
-
-    result = medieval_results[0]
-    field_buttons = result.reply_markup.inline_keyboard[0]
-    token = field_buttons[0].callback_data.split(":")[1]
-
-    # 3. user sends it into a chat
-    await handle_chosen_inline_result(app, FakeChosen(result.id, "inline-medieval"))
-    contract = app.store.for_inline("inline-medieval")
-    assert contract is not None
-    assert contract.template_key == "medieval"
-
-    # 4. first signer presses the button -> deep link to DM
-    press = FakeCallback(
-        f"isg:{token}:medieval:party1", FakeUser(10, first_name="Иван"), "inline-medieval"
-    )
-    await handle_callback(app, press)
-    link = press.urls[-1]
-    assert link.startswith("https://t.me/")
-
-    # 5. DM deep link sets pending
-    first = FakeUser(10, first_name="Иван", username="ivan")
-    start = FakeDM(f"/start {link.split('?start=')[1]}", first)
-    await handle_dm(app, start)
-    assert app.store.pending_for(10) is not None
-
-    # 6. signature text
-    await handle_dm(app, FakeDM("Иванов И.И.", first))
-    assert contract.signatures["party1"].text == "Иванов И.И."
-    assert app.store.pending_for(10) is None
-    assert bot.edits, "после первой подписи сообщение должно обновиться"
-    assert "Осталось" in bot.edits[-1]["media"].caption
-
-    # 7. second signer
-    press2 = FakeCallback(
-        f"isg:{token}:medieval:party2", FakeUser(20, first_name="Пётр"), "inline-medieval"
-    )
-    await handle_callback(app, press2)
-    second = FakeUser(20, first_name="Пётр", username="")
-    await handle_dm(app, FakeDM(f"/start {press2.urls[-1].split('?start=')[1]}", second))
-    await handle_dm(app, FakeDM("Петров П.П.", second))
-
-    # 8. finished
-    assert contract.state == STATE_SIGNED
-    final = bot.edits[-1]
-    assert final["inline_message_id"] == "inline-medieval"
-    assert final["media"].media == "signed-file-id"
-    assert final["reply_markup"].inline_keyboard == []
-    assert "Подписано" in final["media"].caption
-
-    # 9. archive caption in the owner's chat has both links
-    assert "https://t.me/ivan" in storage.caption
-    assert "tg://user?id=20" in storage.caption
-    assert "Сторона 1" in storage.caption and "Сторона 2" in storage.caption
-    assert storage.bytes[:2] == b"\xff\xd8"
-
-    # 10. stale button no longer starts a new signing
-    late = FakeCallback(
-        f"isg:{token}:medieval:party1", FakeUser(30), "inline-medieval"
-    )
-    await handle_callback(app, late)
-    assert late.answers[-1] == app.config.text("callback.done")
+def photo_result(message: FakeGuestMessage):
+    """The photo the bot sent in reply to a summon."""
+    assert message.answers, "бот должен ответить в чат"
+    return message.answers[-1]
 
 
-# ---------------------------------------------------------------------------
-# регрессии: кнопки должны работать у всех участников и переживать рестарт
-# ---------------------------------------------------------------------------
-
-
-class FakeGuestMessage:
-    """Сообщение-упоминание в guest-режиме."""
-
-    def __init__(self, text: str, user: FakeUser, chat: FakeChat | None = None):
-        self.text = text
-        self.from_user = user
-        self.chat = chat or FakeChat(-100500)
-        self.guest_query_id = f"guest-{user.id}"
-        self.guest_bot_caller_user = user
-        self.guest_bot_caller_chat = self.chat
-        self.message_thread_id = None
-        self.reply_to_message = None
-
-
-class FakeSent:
-    def __init__(self, inline_message_id: str):
-        self.inline_message_id = inline_message_id
-
-
-def wire(app):
-    bot = FakeBot()
-    storage = FakeStorage()
-    app.bot = bot  # type: ignore[assignment]
-    app.storage = storage  # type: ignore[assignment]
-    return app, bot, storage
+def buttons(result) -> list[str]:
+    markup = result.reply_markup
+    return [button.callback_data for row in markup.inline_keyboard for button in row]
 
 
 async def press(app, data: str, user: FakeUser, inline_id: str | None = None):
-    query = FakeCallback(data, user, inline_id) if inline_id else FakeCallback(data, user)
+    query = FakeCallback(data, user, inline_id)
     query.message = None
     await handle_callback(app, query)
     return query
 
 
+def reply_to_bot(text: str, user: FakeUser, contract, *, query_id: str = "reply"):
+    """A guest message that answers the bot's contract message."""
+    return FakeGuestMessage(
+        text,
+        user,
+        reply_to=types.SimpleNamespace(
+            from_user=FakeUser(999, first_name="Bot", is_bot=True, username="test_bot")
+        ),
+        query_id=query_id,
+    )
+
+
+@pytest.mark.asyncio
+async def test_full_chat_flow(wired):
+    app, bot, storage = wired
+    anna = FakeUser(10, first_name="Аня", username="anna")
+    boris = FakeUser(20, first_name="Борис", username="")
+
+    # 1. @бот -> превью-карусель прямо в чате
+    summon = FakeGuestMessage("@test_bot", anna)
+    await handle_chat_message(app, summon)
+    preview = photo_result(summon)
+    contract = app.store.for_chat("g-100500")
+    assert contract is not None
+    assert preview.photo_file_id == "file-classic"
+    assert contract.inline_message_id.startswith("guest-")
+
+    # 2. «Выбрать» превращает превью в контракт с кнопками сторон
+    pick = await press(app, f"pk:{contract.token}:0", anna, contract.inline_message_id)
+    assert pick.answers[-1] == ""
+    assert contract.state == STATE_OPEN
+    assert bot.edits[-1]["inline_message_id"] == contract.inline_message_id
+
+    # 3. Анна жмёт свою сторону -> бот просит подпись в этом же чате
+    side = await press(
+        app, f"sg:{contract.token}:classic:party1", anna, contract.inline_message_id
+    )
+    assert side.answers[-1] == ""
+    assert app.store.pending_for(10).field_key == "party1"
+    assert "Аня" in bot.edits[-1]["media"].caption
+
+    # 4. Анна отвечает на сообщение бота
+    await handle_chat_message(app, reply_to_bot("Анна А.", anna, contract))
+    assert contract.signatures["party1"].text == "Анна А."
+    assert app.store.pending_for(10) is None
+    assert "Осталось" in bot.edits[-1]["media"].caption
+
+    # 5. Борис подписывает вторую сторону
+    press2 = await press(
+        app, f"sg:{contract.token}:classic:party2", boris, contract.inline_message_id
+    )
+    assert press2.answers[-1] == ""
+    await handle_chat_message(app, reply_to_bot("Борис Б.", boris, contract))
+
+    # 6. Финал: картинка с подписями, кнопок нет
+    assert contract.state == STATE_SIGNED
+    final = bot.edits[-1]
+    assert final["inline_message_id"] == contract.inline_message_id
+    assert final["media"].media == "signed-file-id"
+    assert final["reply_markup"].inline_keyboard == []
+    assert "Подписано" in final["media"].caption
+
+    # 7. Архив владельцу: файл + ссылки на подписантов
+    assert storage.archive
+    caption = storage.archive[-1]["caption"]
+    assert "https://t.me/anna" in caption
+    assert "tg://user?id=20" in caption
+    assert "Сторона 1" in caption and "Сторона 2" in caption
+    assert storage.archive[-1]["data"][:2] == b"\xff\xd8"
+
+    # 8. Позднее нажатие на старую кнопку не запускает новую подпись
+    late = await press(
+        app, f"sg:{contract.token}:classic:party1", FakeUser(30), contract.inline_message_id
+    )
+    assert late.answers[-1] == app.config.text("callback.done")
+
+
 @pytest.mark.asyncio
 async def test_any_chat_member_can_press_both_sides(wired):
-    """Не только владелец: любые два участника чата подписывают контракт."""
     app, _, _ = wired
-
-    query = FakeInlineQuery("")
-    await handle_inline_query(app, query)
-    result = query.answers[0]["results"][0]
-    token = result.reply_markup.inline_keyboard[0][0].callback_data.split(":")[1]
-    await handle_chosen_inline_result(app, FakeChosen(result.id, "inline-shared"))
+    summon = FakeGuestMessage("@test_bot", FakeUser(1, first_name="Автор"))
+    await handle_chat_message(app, summon)
+    contract = app.store.for_chat("g-100500")
 
     anna = FakeUser(10, first_name="Аня", username="anna")
     boris = FakeUser(20, first_name="Борис", username="")
 
-    first = await press(app, f"isg:{token}:classic:party1", anna, "inline-shared")
-    assert first.urls[-1] == f"https://t.me/test_bot?start=s_{token}_party1"
+    await press(app, f"sg:{contract.token}:classic:party1", anna, contract.inline_message_id)
+    assert app.store.pending_for(10) is not None
+    await handle_chat_message(app, reply_to_bot("Анна А.", anna, contract))
 
-    await handle_dm(app, FakeDM(f"/start s_{token}_party1", anna))
-    await handle_dm(app, FakeDM("Анна А.", anna))
+    await press(app, f"sg:{contract.token}:classic:party2", boris, contract.inline_message_id)
+    assert app.store.pending_for(20) is not None
+    await handle_chat_message(app, reply_to_bot("Борис Б.", boris, contract))
 
-    second = await press(app, f"isg:{token}:classic:party2", boris, "inline-shared")
-    assert second.urls[-1] == f"https://t.me/test_bot?start=s_{token}_party2"
-    await handle_dm(app, FakeDM(f"/start s_{token}_party2", boris))
-    await handle_dm(app, FakeDM("Борис Б.", boris))
-
-    contract = app.store.for_inline("inline-shared")
     assert contract.state == STATE_SIGNED
     assert contract.signatures["party1"].user_id == 10
     assert contract.signatures["party2"].user_id == 20
@@ -233,84 +229,49 @@ async def test_any_chat_member_can_press_both_sides(wired):
 @pytest.mark.asyncio
 async def test_buttons_survive_restart(wired, config):
     """После перезапуска бота кнопки продолжают работать."""
-    app, bot, _ = wired
+    app, _, _ = wired
     from app.app import App
 
-    query = FakeInlineQuery("рыцарь")
-    await handle_inline_query(app, query)
-    result = query.answers[0]["results"][0]
-    token = result.reply_markup.inline_keyboard[0][0].callback_data.split(":")[1]
-    await handle_chosen_inline_result(app, FakeChosen(result.id, "inline-restart"))
-
-    # «перезапуск»: новый App, пустое хранилище
-    fresh = App(config)
-    fresh.bot_username = "test_bot"
-    fresh.bot_id = 999
-    fresh, fresh_bot, _ = wire(fresh)
-    assert fresh.store.get(token) is None
-
-    user = FakeUser(77, first_name="Гость")
-    reopened = await press(fresh, f"isg:{token}:medieval:party2", user, "inline-restart")
-    assert reopened.urls[-1] == f"https://t.me/test_bot?start=s_{token}_party2"
-
-    contract = fresh.store.for_inline("inline-restart")
-    assert contract is not None
-    assert contract.template_key == "medieval"
-
-    await handle_dm(fresh, FakeDM(f"/start s_{token}_party2", user))
-    await handle_dm(fresh, FakeDM("Гость Г.", user))
-    assert contract.signatures["party2"].text == "Гость Г."
-    assert fresh_bot.edits and fresh_bot.edits[-1]["inline_message_id"] == "inline-restart"
-
-
-@pytest.mark.asyncio
-async def test_legacy_guest_buttons_keep_working(wired):
-    """Кнопки, отправленные до обновления (без ключа шаблона), тоже живые."""
-    app, bot, _ = wired
-
-    async def answer_guest_query(*, result):
-        return FakeSent("guest-inline-1")
-
-    app.post_guest_text = _noop  # type: ignore[assignment]
-    original = FakeGuestMessage("@test_bot", FakeUser(1))
-    original.answer_guest_query = answer_guest_query  # type: ignore[attr-defined]
-
-    from app.handlers import handle_guest
-
-    await handle_guest(app, original)
+    await handle_chat_message(app, FakeGuestMessage("@test_bot", FakeUser(1)))
     contract = app.store.for_chat("g-100500")
     assert contract is not None
 
-    # старый формат callback_data: без ключа шаблона
-    member = FakeUser(55, first_name="Член")
-    query = FakeCallback(f"sg:{contract.token}:party1", member, "guest-inline-1")
-    await handle_callback(app, query)
-    assert query.answers[-1] == ""
-    assert app.store.pending_for(55) is not None
-    assert app.store.pending_for(55).field_key == "party1"
+    fresh, fresh_bot, _ = _wire(App(config))
+    fresh.bot_username = "test_bot"
+    fresh.bot_id = 999
+    assert fresh.store.get(contract.token) is None
+
+    member = FakeUser(77, first_name="Гость")
+    reopened = await press(
+        fresh, f"sg:{contract.token}:classic:party2", member, contract.inline_message_id
+    )
+    assert reopened.answers[-1] == "", reopened.answers
+    restored = fresh.store.get(contract.token)
+    assert restored is not None
+    assert restored.template_key == "classic"
+    assert fresh.store.pending_for(77) is not None
+    assert fresh_bot.edits and fresh_bot.edits[-1]["inline_message_id"] == contract.inline_message_id
+
+
+def _wire(app):
+    bot = FakeBot()
+    storage = FakeStorage()
+    app.bot = bot  # type: ignore[assignment]
+    app.storage = storage  # type: ignore[assignment]
+    return app, bot, storage
 
 
 @pytest.mark.asyncio
 async def test_new_mention_does_not_kill_old_buttons(wired):
     """Второе упоминание бота в чате не ломает кнопки первого сообщения."""
-    app, bot, _ = wired
-    from app.handlers import handle_guest
-
-    counter = {"n": 0}
-
-    async def answer_guest_query(*, result):
-        counter["n"] += 1
-        return FakeSent(f"guest-inline-{counter['n']}")
-
+    app, _, _ = wired
     chat = FakeChat(-100500)
     owner = FakeUser(1)
     contracts = []
 
     for index in (1, 2):
-        message = FakeGuestMessage("@test_bot", owner, chat)
-        message.guest_query_id = f"guest-{index}"
-        message.answer_guest_query = answer_guest_query  # type: ignore[attr-defined]
-        await handle_guest(app, message)
+        message = FakeGuestMessage("@test_bot", owner, chat, query_id=f"q{index}")
+        await handle_chat_message(app, message)
         contracts.append(app.store.for_chat("g-100500"))
 
     assert len(contracts) == 2
@@ -319,44 +280,265 @@ async def test_new_mention_does_not_kill_old_buttons(wired):
     assert app.store.get(first.token) is first
 
     member = FakeUser(66, first_name="Второй")
-    query = FakeCallback(f"sg:{first.token}:classic:party1", member, first.inline_message_id)
-    await handle_callback(app, query)
-    assert query.answers[-1] == "", query.answers
+    query = await press(
+        app, f"sg:{first.token}:classic:party1", member, first.inline_message_id
+    )
+    assert query.answers[-1] == ""
     assert app.store.pending_for(66).field_key == "party1"
 
 
-async def _noop(*_args, **_kwargs) -> None:
-    return None
-
-
-class ChatCallback(FakeCallback):
-    """Нажатие на обычное сообщение бота в чате (без inline_message_id)."""
-
-    def __init__(self, data: str, user: FakeUser, chat_id: int = -100500, message_id: int = 500):
-        super().__init__(data, user, None)
-        self.message = types.SimpleNamespace(
-            chat=types.SimpleNamespace(id=chat_id), message_id=message_id
-        )
+# ---------------------------------------------------------------------------
+# свободные условия
+# ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_guest_button_recovers_after_restart(wired, config):
-    """Кнопки guest-сообщения в чате тоже переживают перезапуск."""
+async def test_free_terms_flow(wired):
+    app, bot, storage = wired
+    anna = FakeUser(10, first_name="Аня", username="anna")
+    boris = FakeUser(20, first_name="Борис", username="")
+
+    # 1. @бот условия -> бот просит текст условий
+    summon = FakeGuestMessage("@test_bot условия", anna)
+    await handle_chat_message(app, summon)
+    contract = app.store.for_chat("g-100500")
+    assert contract is not None
+    assert contract.template_key == "free"
+    assert contract.state == STATE_TERMS
+    assert contract.terms_user_id == 10
+    prompt = photo_result(summon)
+    assert "Пришли условия" in prompt.caption
+
+    # 2. Чужой текст не подхватывается
+    stranger = FakeUser(33, first_name="Мимо")
+    await handle_chat_message(app, reply_to_bot("не мои условия", stranger, contract))
+    assert contract.terms == ""
+
+    # 3. Автор присылает условия -> бланк перерисовывается с текстом
+    terms = "Исполнитель делает макет, Заказчик платит 1000 ₽ до пятницы."
+    await handle_chat_message(app, reply_to_bot(terms, anna, contract))
+    assert contract.terms == terms
+    assert contract.state == STATE_OPEN
+    assert storage.uploads, "бланк с условиями должен быть загружен"
+    assert storage.uploads[-1]["data"][:2] == b"\xff\xd8"
+    assert contract.blank_file_id == "blank-with-terms-1"
+    assert bot.edits[-1]["media"].media == "blank-with-terms-1"
+    assert bot.edits[-1]["reply_markup"] is not None
+
+    # 4. Подписи собираются как обычно
+    await press(app, f"sg:{contract.token}:free:party1", anna, contract.inline_message_id)
+    await handle_chat_message(app, reply_to_bot("Анна А.", anna, contract))
+    await press(app, f"sg:{contract.token}:free:party2", boris, contract.inline_message_id)
+    await handle_chat_message(app, reply_to_bot("Борис Б.", boris, contract))
+
+    assert contract.state == STATE_SIGNED
+    final = bot.edits[-1]
+    assert final["media"].media == "signed-file-id"
+    assert final["reply_markup"].inline_keyboard == []
+    # Условия попадают и в архивную подпись
+    assert "Условия:" in storage.archive[-1]["caption"]
+    assert "1000" in storage.archive[-1]["caption"]
+
+
+@pytest.mark.asyncio
+async def test_terms_reject_too_long_text(wired):
+    app, _, _ = wired
+    anna = FakeUser(10, first_name="Аня")
+    await handle_chat_message(app, FakeGuestMessage("@test_bot условия", anna))
+    contract = app.store.for_chat("g-100500")
+
+    too_long = "а" * 900
+    reply = reply_to_bot(too_long, anna, contract)
+    await handle_chat_message(app, reply)
+    assert contract.terms == ""
+    assert contract.state == STATE_TERMS
+    assert reply.answers, "должна быть подсказка про длину"
+    assert "Сократи" in reply.answers[-1].input_message_content.message_text
+
+
+@pytest.mark.asyncio
+async def test_terms_can_be_chosen_from_carousel(wired):
+    app, bot, _ = wired
+    anna = FakeUser(10, first_name="Аня")
+    summon = FakeGuestMessage("@test_bot", anna)
+    await handle_chat_message(app, summon)
+    contract = app.store.for_chat("g-100500")
+
+    # «Свободный договор» — пятый бланк (индекс 4)
+    pick = await press(app, f"pk:{contract.token}:4", anna, contract.inline_message_id)
+    assert pick.answers[-1] == ""
+    assert contract.template_key == "free"
+    assert contract.state == STATE_TERMS
+    assert "Пришли условия" in bot.edits[-1]["media"].caption
+
+
+# ---------------------------------------------------------------------------
+# бот добавлен в чат (member mode) — всё так же в чате
+# ---------------------------------------------------------------------------
+
+
+class FakeChatMessage:
+    """Обычное сообщение в группе, где бот состоит участником."""
+
+    def __init__(
+        self,
+        text: str,
+        user: FakeUser,
+        chat: FakeChat | None = None,
+        *,
+        reply_to: object | None = None,
+    ) -> None:
+        self.text = text
+        self.from_user = user
+        self.chat = chat or FakeChat(-100777)
+        self.guest_query_id = None
+        self.guest_bot_caller_user = None
+        self.guest_bot_caller_chat = None
+        self.message_thread_id = None
+        self.reply_to_message = reply_to
+        self.replies: list[str] = []
+        self.photos: list[dict] = []
+
+    async def answer_photo(self, photo, caption="", parse_mode=None, reply_markup=None):
+        message = types.SimpleNamespace(
+            chat=self.chat, message_id=900 + len(self.photos)
+        )
+        self.photos.append(
+            {
+                "photo": photo,
+                "caption": caption,
+                "reply_markup": reply_markup,
+                "message_id": message.message_id,
+            }
+        )
+        return message
+
+    async def reply(self, text, parse_mode=None, **_: object):
+        self.replies.append(text)
+        return None
+
+
+@pytest.mark.asyncio
+async def test_member_mode_keeps_everything_in_chat(wired):
+    app, bot, storage = wired
+    chat = FakeChat(-100777)
+    anna = FakeUser(10, first_name="Аня", username="anna")
+    boris = FakeUser(20, first_name="Борис", username="")
+
+    summon = FakeChatMessage("@test_bot", anna, chat)
+    await handle_chat_message(app, summon)
+
+    contract = app.store.for_chat("g-100777")
+    assert contract is not None
+    assert summon.photos, "бот должен прислать бланк обычным сообщением"
+    assert contract.chat_id == -100777
+    assert contract.message_id == 900
+    assert summon.photos[0]["photo"] == "file-classic"
+
+    # Выбор бланка и подпись — всё по message_id, без inline_message_id
+    pick = await press(app, f"pk:{contract.token}:0", anna)
+    assert pick.answers[-1] == ""
+    assert bot.edits[-1]["chat_id"] == -100777
+    assert bot.edits[-1]["message_id"] == 900
+
+    side = await press(app, f"sg:{contract.token}:classic:party1", anna)
+    assert side.answers[-1] == ""
+    assert app.store.pending_for(10) is not None
+
+    bot_user = FakeUser(999, first_name="Bot", is_bot=True, username="test_bot")
+    await handle_chat_message(
+        app, FakeChatMessage("Анна А.", anna, chat, reply_to=types.SimpleNamespace(from_user=bot_user))
+    )
+    assert contract.signatures["party1"].text == "Анна А."
+
+    await press(app, f"sg:{contract.token}:classic:party2", boris)
+    await handle_chat_message(
+        app, FakeChatMessage("Борис Б.", boris, chat, reply_to=types.SimpleNamespace(from_user=bot_user))
+    )
+
+    assert contract.state == STATE_SIGNED
+    final = bot.edits[-1]
+    assert final["chat_id"] == -100777
+    assert final["media"].media == "signed-file-id"
+    assert final["reply_markup"].inline_keyboard == []
+    assert storage.archive
+
+
+@pytest.mark.asyncio
+async def test_member_mode_ignores_chatter_without_reply(wired):
+    """В чате-участнике обычная болтовня не превращается в подпись."""
+    app, _, _ = wired
+    chat = FakeChat(-100777)
+    anna = FakeUser(10, first_name="Аня")
+
+    await handle_chat_message(app, FakeChatMessage("@test_bot", anna, chat))
+    contract = app.store.for_chat("g-100777")
+    await press(app, f"sg:{contract.token}:classic:party1", anna)
+    assert app.store.pending_for(10) is not None
+
+    chatter = FakeChatMessage("просто болтаю в чате", anna, chat)
+    await handle_chat_message(app, chatter)
+    assert contract.signatures == {}
+    assert app.store.pending_for(10) is not None
+    assert chatter.replies == []
+
+
+@pytest.mark.asyncio
+async def test_member_mode_terms_flow(wired):
+    app, bot, storage = wired
+    chat = FakeChat(-100777)
+    anna = FakeUser(10, first_name="Аня", username="anna")
+    bot_user = FakeUser(999, first_name="Bot", is_bot=True, username="test_bot")
+
+    summon = FakeChatMessage("@test_bot условия", anna, chat)
+    await handle_chat_message(app, summon)
+    contract = app.store.for_chat("g-100777")
+    assert contract is not None and contract.state == STATE_TERMS
+    assert "Пришли условия" in summon.photos[0]["caption"]
+
+    await handle_chat_message(
+        app,
+        FakeChatMessage(
+            "Оплата 500 ₽ после сдачи.",
+            anna,
+            chat,
+            reply_to=types.SimpleNamespace(from_user=bot_user),
+        ),
+    )
+    assert contract.terms == "Оплата 500 ₽ после сдачи."
+    assert contract.state == STATE_OPEN
+    assert storage.uploads
+    assert bot.edits[-1]["chat_id"] == -100777
+    assert bot.edits[-1]["media"].media == "blank-with-terms-1"
+
+
+@pytest.mark.asyncio
+async def test_member_mode_buttons_survive_restart(wired, config):
+    """В режиме участника кнопки тоже восстанавливаются после перезапуска."""
+    app, _, _ = wired
     from app.app import App
 
-    app, _, _ = wired
-    token = "abc12345"
+    chat = FakeChat(-100777)
+    anna = FakeUser(10, first_name="Аня")
+    await handle_chat_message(app, FakeChatMessage("@test_bot", anna, chat))
+    contract = app.store.for_chat("g-100777")
+    assert contract is not None and contract.message_id
 
-    fresh, bot, _ = wire(App(config))
+    fresh, fresh_bot, _ = _wire(App(config))
     fresh.bot_username = "test_bot"
+    fresh.bot_id = 999
 
-    query = ChatCallback(f"sg:{token}:classic:party2", FakeUser(88, first_name="Член"))
+    # Callback на обычное сообщение в чате: message присутствует, inline нет
+    query = FakeCallback(f"sg:{contract.token}:classic:party1", FakeUser(55))
+    query.inline_message_id = None
+    query.message = types.SimpleNamespace(
+        chat=types.SimpleNamespace(id=-100777), message_id=contract.message_id
+    )
     await handle_callback(fresh, query)
 
     assert query.answers[-1] == "", query.answers
-    contract = fresh.store.get(token)
-    assert contract is not None
-    assert contract.chat_key == "g-100500"
-    assert fresh.store.pending_for(88) is not None
-    assert bot.edits and bot.edits[-1]["chat_id"] == -100500
-    assert bot.edits[-1]["message_id"] == 500
+    restored = fresh.store.get(contract.token)
+    assert restored is not None
+    assert restored.chat_id == -100777
+    assert restored.message_id == contract.message_id
+    assert fresh_bot.edits[-1]["chat_id"] == -100777

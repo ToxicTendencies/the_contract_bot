@@ -17,6 +17,7 @@ from .config import (
     Limits,
     RenderSettings,
     TemplateConfig,
+    TermsConfig,
     TextStyle,
 )
 
@@ -334,6 +335,28 @@ def draw_layout(
         y += line.height + layout.spacing
 
 
+def validate_terms(text: str, terms: TermsConfig) -> SignatureCheck:
+    """Проверить свободный текст условий: длина в графемах и вёрстка в box."""
+    normalized = normalize_text(text)
+    length = count_graphemes(normalized)
+    max_length = terms.style.max_length
+
+    if not normalized:
+        return SignatureCheck(False, normalized, 0, max_length, "empty")
+    if length > max_length:
+        return SignatureCheck(False, normalized, length, max_length, "too_long")
+
+    layout = layout_text(
+        normalized,
+        terms.box,
+        terms.style,
+        max_lines=terms.style.max_lines,
+    )
+    if layout is None:
+        return SignatureCheck(False, normalized, length, max_length, "does_not_fit")
+    return SignatureCheck(True, normalized, length, max_length, layout=layout)
+
+
 def validate_signature(text: str, field: FieldConfig, limits: Limits) -> SignatureCheck:
     normalized = normalize_text(text)
     length = count_graphemes(normalized)
@@ -380,12 +403,31 @@ def render_contract(
     signatures: dict[str, str],
     *,
     self_sign_note: str | None = None,
+    terms: str | None = None,
     settings: RenderSettings | None = None,
 ) -> bytes:
-    """Draw all signatures and return a Telegram-ready JPEG."""
+    """Draw terms, signatures and the optional note; return a JPEG."""
     settings = settings or RenderSettings()
     image = load_template_image(template.file)
     draw = ImageDraw.Draw(image)
+
+    if terms and template.terms is not None:
+        layout = layout_text(
+            terms,
+            template.terms.box,
+            template.terms.style,
+            max_lines=template.terms.style.max_lines,
+        )
+        if layout is None:
+            raise RenderError("Условия не помещаются в блок на бланке")
+        draw_layout(
+            draw,
+            layout,
+            template.terms.box,
+            template.terms.style.color,
+            template.terms.style.align,
+            template.terms.style.valign,
+        )
 
     for key, text in signatures.items():
         field = template.fields.get(key)
@@ -455,5 +497,28 @@ def debug_image(template: TemplateConfig, *, draw_samples: bool = True) -> Image
 
     if template.note is not None:
         mark(template.note.box, "self_sign_note", (30, 80, 200))
+
+    if template.terms is not None:
+        mark(template.terms.box, "terms", (150, 40, 150))
+        if draw_samples:
+            sample = (
+                "Условия пишутся свободным текстом: сроки, оплата, "
+                "ответственность сторон."
+            )
+            layout = layout_text(
+                sample,
+                template.terms.box,
+                template.terms.style,
+                max_lines=template.terms.style.max_lines,
+            )
+            if layout is not None:
+                draw_layout(
+                    draw,
+                    layout,
+                    template.terms.box,
+                    (150, 40, 150),
+                    template.terms.style.align,
+                    template.terms.style.valign,
+                )
 
     return image

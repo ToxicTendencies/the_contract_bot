@@ -136,23 +136,33 @@ class TemplateStorage:
         self._save()
         return ready, len(templates)
 
-    async def upload_signed(self, bot: Bot, data: bytes, caption: str) -> str:
-        """Upload a finished contract and return its file_id (also archives it).
+    async def upload_image(
+        self, bot: Bot, data: bytes, caption: str, *, filename: str = "contract.jpg"
+    ) -> str:
+        """Send an image to the storage chat and return its file_id.
 
-        ``caption`` is HTML and already contains the signers' links.
+        Inline (guest) messages can only be edited with an existing ``file_id``,
+        so any composed picture has to be uploaded first.
         """
         if len(caption) > 1024:
             caption = caption[:1020] + "…"
         message: Message = await bot.send_photo(
             chat_id=self.chat_id,
-            photo=BufferedInputFile(data, filename="contract.jpg"),
+            photo=BufferedInputFile(data, filename=filename),
             caption=caption,
             parse_mode="HTML",
         )
         file_id = _photo_file_id(message)
         if not file_id:
-            raise RuntimeError("Telegram не вернул file_id подписанного контракта")
+            raise RuntimeError("Telegram не вернул file_id картинки")
         return file_id
+
+    async def upload_signed(self, bot: Bot, data: bytes, caption: str) -> str:
+        """Upload a finished contract and return its file_id (also archives it).
+
+        ``caption`` is HTML and already contains the signers' links.
+        """
+        return await self.upload_image(bot, data, caption)
 
 
 def _photo_file_id(message: Message) -> str | None:

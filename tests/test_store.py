@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import time
 
-from app.store import ContractStore, STATE_PREVIEW
+from app.store import ContractStore, STATE_PREVIEW, STATE_TERMS
 
 
 def make_store(**overrides) -> ContractStore:
@@ -109,3 +109,20 @@ def test_signatures_and_same_signers():
     store.add_signature(contract2, field_key="party1", text="A", user_id=10, user_name="A")
     store.add_signature(contract2, field_key="party2", text="B", user_id=20, user_name="B")
     assert not contract2.same_signers()
+
+
+def test_terms_pending_is_per_chat_and_user():
+    store = make_store()
+    contract = store.create(chat_key="g1", template_key="free", initiator_id=10)
+    contract.state = STATE_TERMS
+    contract.terms_user_id = 10
+
+    assert store.terms_for_user(10, "g1") is contract
+    assert store.terms_for_user(11, "g1") is None
+    assert store.terms_for_user(10, "g2") is None
+
+    store.set_terms(contract, "Оплата 1000 ₽")
+    assert contract.terms == "Оплата 1000 ₽"
+    assert contract.state == "open"
+    assert contract.terms_user_id == 0
+    assert store.terms_for_user(10, "g1") is None

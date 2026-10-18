@@ -1,14 +1,17 @@
-"""Telegram handlers.
+"""Telegram handlers: everything happens inside the chat.
 
-Two ways to start a contract:
+The bot is summoned with ``@bot`` in any chat, posts the blank right there and
+edits its own message as the contract moves along.  A side button sets the
+pending signature for that member, and the signature itself is sent as a reply
+to the bot's message.
 
-* **inline mode** — ``@bot`` or ``@bot средневековый`` in any chat.  Choosing a
-  result posts the blank with buttons; a button press opens the bot's DM where
-  the signature is typed.  The inline message is edited when everyone signed.
-* **guest mode** — a plain ``@bot`` mention message.  Everything, including the
-  signature, happens in the chat.
+Two ways to be in a chat are supported: **guest mode** (the bot is not a member
+and answers the summon) and **member mode** (the bot was added to the group and
+sends a normal message).  Both share the same scenario.  The owner's DM is only
+used for commands and the archive.
 
-Owner commands live in the DM as well.
+Templates may have a free-form ``terms`` block: then the bot first asks for the
+contract text and prints it on the blank before collecting signatures.
 """
 
 from __future__ import annotations
@@ -19,23 +22,12 @@ import re
 from typing import TYPE_CHECKING, Awaitable, Callable
 
 from aiogram import F, Router
-from aiogram.enums import ChatType, ParseMode
-from aiogram.types import (
-    CallbackQuery,
-    ChosenInlineResult,
-    ForceReply,
-    InlineQuery,
-    InlineQueryResultArticle,
-    InlineQueryResultCachedPhoto,
-    InputTextMessageContent,
-    Message,
-    User,
-)
+from aiogram.enums import ChatType
+from aiogram.types import CallbackQuery, Message, User
 
-from . import ui
 from .config import TemplateConfig
-from .render import validate_signature
-from .store import STATE_SIGNED, Contract, chat_key, new_token
+from .render import validate_signature, validate_terms
+from .store import STATE_SIGNED, STATE_TERMS, Contract, chat_key
 
 if TYPE_CHECKING:  # pragma: no cover
     from .app import App
@@ -43,12 +35,6 @@ if TYPE_CHECKING:  # pragma: no cover
 log = logging.getLogger(__name__)
 
 Say = Callable[[str], Awaitable[None]]
-
-# /start payload prefix for "open signature prompt for <token>_<field>"
-DEEPLINK_PREFIX = "s_"
-
-# Telegram caps start parameters at 64 chars: "s_" + 8 token + "_" + 16 field.
-MAX_START_PAYLOAD = 64
 
 
 def _sender(message: Message) -> User | None:
@@ -86,30 +72,46 @@ def _error_text(app: "App", error: str | None, check, field_label: str) -> str:
     )
 
 
+def _max_terms_length(app: "App") -> int:
+    limits = [
+        template.terms.style.max_length
+        for template in app.config.templates.ordered()
+        if template.terms is not None
+    ]
+    return max(limits) if limits else 0
+
+
+def _terms_error_text(app: "App", error: str | None, check) -> str:
+    key = {
+        "empty": "guest.terms_empty",
+        "too_long": "guest.terms_too_long",
+        "does_not_fit": "guest.terms_does_not_fit",
+    }.get(error or "", "guest.terms_does_not_fit")
+    return app.config.text(
+        key,
+        length=check.length,
+        max_length=check.max_length,
+    )
+
+
 def build_router(app: "App") -> Router:
     router = Router(name="contracts")
-
-    @router.inline_query()
-    async def on_inline(inline_query: InlineQuery) -> None:
-        try:
-            await handle_inline_query(app, inline_query)
-        except Exception:  # noqa: BLE001
-            log.exception("Ошибка обработки inline-запроса")
-
-    @router.chosen_inline_result()
-    async def on_chosen(result: ChosenInlineResult) -> None:
-        try:
-            await handle_chosen_inline_result(app, result)
-        except Exception:  # noqa: BLE001
-            log.exception("Ошибка обработки выбранного inline-результата")
 
     @router.guest_message()
     async def on_guest(message: Message) -> None:
         try:
-            await handle_guest(app, message)
+            await handle_chat_message(app, message)
         except Exception:  # noqa: BLE001
             log.exception("Ошибка обработки guest-сообщения")
-            await app.post_guest_text(message, app.config.text("errors.generic"))
+            await app.post_text(message, app.config.text("errors.generic"))
+
+    @router.message(F.chat.type.in_({"group", "supergroup"}), F.text)
+    async def on_group_message(message: Message) -> None:
+        try:
+            await handle_chat_message(app, message)
+        except Exception:  # noqa: BLE001
+            log.exception("Ошибка обработки сообщения в чате")
+            await app.post_text(message, app.config.text("errors.generic"))
 
     @router.callback_query()
     async def on_callback(query: CallbackQuery) -> None:
@@ -134,132 +136,7 @@ def build_router(app: "App") -> Router:
 
 
 # ---------------------------------------------------------------------------
-# inline mode
-# ---------------------------------------------------------------------------
-
-
-async def handle_inline_query(app: "App", inline_query: InlineQuery) -> None:
-    templates = app.config.templates.find_all(inline_query.query)
-    results: list[object] = []
-    max_results = 50  # Telegram's hard limit
-
-    for template in templates[:max_results]:
-        file_id = app.storage.file_id(template.key)
-        if not file_id:
-            continue
-        token = new_token()
-        results.append(
-            InlineQueryResultCachedPhoto(
-                id=f"{token}-{template.key}",
-                photo_file_id=file_id,
-                title=template.inline_name,
-                description=template.inline_hint,
-                caption=ui.inline_caption(
-                    app.config, template, app.max_length_for(template)
-                ),
-                parse_mode=ParseMode.HTML,
-                reply_markup=ui.inline_sign_markup(app.config, token, template),
-            )
-        )
-
-    if not results:
-        names = ", ".join(template.inline_name for template in app.templates())
-        title = (
-            app.config.text("inline.nothing_found_title")
-            if inline_query.query.strip()
-            else app.config.text("inline.uploading_title")
-        )
-        description = (
-            app.config.text("inline.nothing_found_description", names=names)
-            if inline_query.query.strip()
-            else app.config.text("inline.uploading_description")
-        )
-        results.append(
-            InlineQueryResultArticle(
-                id="no-results",
-                title=title,
-                description=description,
-                input_message_content=InputTextMessageContent(
-                    message_text=description, parse_mode=ParseMode.HTML
-                ),
-            )
-        )
-
-    await inline_query.answer(
-        results,
-        cache_time=0,
-        is_personal=True,
-    )
-
-
-async def handle_chosen_inline_result(app: "App", result: ChosenInlineResult) -> None:
-    """Bind the sent inline message to a contract.
-
-    Inline feedback is optional: the same binding also happens on the first
-    button press, which always carries ``inline_message_id``.
-    """
-    if not result.inline_message_id:
-        return
-    token, _, template_key = result.result_id.partition("-")
-    template = app.config.templates.get(template_key)
-    if template is None or not token:
-        return
-
-    contract = app.store.get(token)
-    if contract is None:
-        app.store.create(
-            template_key=template_key,
-            inline_message_id=result.inline_message_id,
-            initiator_id=result.from_user.id,
-            initiator_name=_user_name(result.from_user),
-            token=token,
-        )
-    elif not contract.inline_message_id:
-        app.store.bind_inline(contract, result.inline_message_id)
-
-
-async def _handle_inline_sign_press(
-    app: "App",
-    query: CallbackQuery,
-    token: str,
-    template_key: str,
-    field_key: str,
-) -> None:
-    """Кнопка стороны на inline-сообщении: открыть личку с подсказкой.
-
-    Callback всегда несёт ``inline_message_id``, поэтому контракт можно
-    восстановить, даже если бот перезапускался.
-    """
-    contract = _resolve_contract(app, query, token, template_key, query.from_user)
-    if contract is None:
-        await query.answer(_callback_expired(app))
-        return
-
-    template = _template_for(app, contract, template_key)
-    field = template.fields.get(field_key) if template else None
-    if template is None or field is None:
-        await query.answer(_callback_expired(app))
-        return
-
-    if contract.state == STATE_SIGNED:
-        await query.answer(app.config.text("callback.done"))
-        return
-    if field_key in contract.signatures:
-        await query.answer(app.config.text("callback.already_signed", label=field.label))
-        return
-
-    holder = app.store.pending_holder(contract.token, field_key)
-    if holder is not None and holder != query.from_user.id:
-        await query.answer(app.config.text("callback.waiting"))
-        return
-
-    payload = f"{DEEPLINK_PREFIX}{contract.token}_{field_key}"
-    url = f"https://t.me/{app.bot_username}?start={payload}"
-    await query.answer(app.config.text("inline.opening_dm"), url=url)
-
-
-# ---------------------------------------------------------------------------
-# signatures (shared by DM and guest flows)
+# signatures and free-form terms (collected in the chat)
 # ---------------------------------------------------------------------------
 
 
@@ -310,22 +187,19 @@ async def apply_signature(
 
     if len(contract.signatures) >= len(template.fields):
         ok = await app.finalize(contract, template)
-        await say(
-            app.config.text("dm.sign_complete" if ok else "guest.upload_failed")
-        )
+        await say(app.config.text("guest.sign_complete" if ok else "guest.upload_failed"))
         return
 
     remaining = [
         field.label for key, field in template.fields.items() if key not in contract.signatures
     ]
-    if contract.inline_message_id:
+    if contract.has_message:
         await app.show_signed_progress(contract, template, field_key)
     await say(
         app.config.text(
-            "dm.sign_saved",
+            "guest.sign_saved",
             label=html.escape(field.label),
             remaining=html.escape(", ".join(remaining)),
-            bot=app.bot_username,
         )
     )
 
@@ -347,35 +221,93 @@ async def handle_pending_text(
     await apply_signature(app, contract, user, text, say, pending_field=pending.field_key)
 
 
-# ---------------------------------------------------------------------------
-# guest mode (everything in the chat)
-# ---------------------------------------------------------------------------
-
-
-async def handle_guest(app: "App", message: Message) -> None:
-    if not message.guest_query_id:
+async def handle_terms_text(
+    app: "App",
+    message: Message,
+    user: User,
+    text: str,
+    say: Say,
+    contract: Contract,
+) -> None:
+    """Validate the free-form terms and print them on the blank."""
+    template = app.template_or_first(contract.template_key)
+    if template is None or template.terms is None:
+        app.store.drop(contract)
+        await say(app.config.text("guest.contract_expired", bot=app.bot_username))
         return
-    user = _sender(message)
+
+    check = validate_terms(text, template.terms)
+    if not check.ok:
+        await say(_terms_error_text(app, check.error, check))
+        return
+
+    app.store.set_terms(contract, check.text)
+    ok = await app.show_terms_contract(contract, template)
+    if not ok:
+        # Give the sender another chance: keep waiting for the terms.
+        contract.state = STATE_TERMS
+        contract.terms_user_id = user.id
+        contract.touch()
+
+
+# ---------------------------------------------------------------------------
+# guest mode: the whole flow in the chat
+# ---------------------------------------------------------------------------
+
+
+async def handle_chat_message(app: "App", message: Message) -> None:
+    """Единый вход: и guest-ответ, и обычное сообщение в чате-участнике."""
+    user = message.from_user
     if user is None or getattr(user, "is_bot", False):
         return
 
     text = message.text or ""
     query, had_mention = split_mention(text, app.bot_username)
     key = _chat_key(message)
-    contract = app.store.for_chat(key)
 
-    async def say(reply: str) -> None:
-        await app.post_guest_text(message, reply)
+    reply = message.reply_to_message
+    reply_author = reply.from_user if reply is not None else None
+    is_reply_to_bot = bool(reply_author is not None and reply_author.id == app.bot_id)
+    # В guest-режиме бот получает только упоминания и ответы на свои сообщения,
+    # в чате-участнике — всё подряд, поэтому там принимаем текст только ответом.
+    accept_input = bool(message.guest_query_id) or is_reply_to_bot
+
+    async def say(reply_text: str) -> None:
+        await app.post_text(message, reply_text)
 
     if not had_mention:
-        reply_author = message.reply_to_message.from_user if message.reply_to_message else None
-        if reply_author is not None and reply_author.is_bot and reply_author.id != app.bot_id:
+        if reply_author is not None and reply_author.is_bot and not is_reply_to_bot:
             return  # someone is talking to another bot
+
         pending = app.store.pending_for(user.id)
         if pending is not None:
+            if not accept_input:
+                return
+            if not text:
+                await say(app.config.text("guest.text_only"))
+                return
             await handle_pending_text(app, message, user, text, say)
             return
-        if contract is not None and contract.state != STATE_SIGNED:
+
+        terms_contract = app.store.terms_for_user(user.id, key)
+        if terms_contract is not None:
+            if not accept_input:
+                return
+            if not text:
+                await say(app.config.text("guest.text_only"))
+                return
+            await handle_terms_text(app, message, user, text, say, terms_contract)
+            return
+
+        if not accept_input:
+            return
+        contract = app.store.for_chat(key)
+        if contract is None:
+            return
+        if contract.state == STATE_TERMS:
+            await say(app.config.text("guest.terms_not_yours"))
+            return
+        if contract.state != STATE_SIGNED:
             await say(app.config.text("guest.not_pending"))
         return
 
@@ -388,6 +320,7 @@ async def handle_guest(app: "App", message: Message) -> None:
                     bot=app.bot_username,
                     max_length=app.settings.limits.signature_max_length,
                     ttl_minutes=app.settings.contract.ttl_minutes,
+                    terms_max=_max_terms_length(app),
                 )
             )
             return
@@ -403,8 +336,12 @@ async def handle_guest(app: "App", message: Message) -> None:
         template = app.config.templates.find(query)
         if template is None:
             pending = app.store.pending_for(user.id)
-            if pending is not None:
+            if pending is not None and accept_input:
                 await handle_pending_text(app, message, user, query, say)
+                return
+            terms_contract = app.store.terms_for_user(user.id, key)
+            if terms_contract is not None and accept_input:
+                await handle_terms_text(app, message, user, query, say, terms_contract)
                 return
             names = ", ".join(item.key for item in templates)
             await say(
@@ -428,8 +365,16 @@ async def handle_guest(app: "App", message: Message) -> None:
         initiator_name=_user_name(user),
         page=app.index_of(template.key),
     )
-    inline_id = await app.send_preview(message, contract, template)
-    if inline_id is None:
+
+    if template.has_terms:
+        contract.terms_user_id = user.id
+        ok = await app.send_terms_prompt(message, contract, template)
+        if not ok:
+            app.store.drop(contract)
+        return
+
+    ok = await app.send_preview(message, contract, template)
+    if not ok:
         app.store.drop(contract)
 
 
@@ -455,16 +400,14 @@ async def handle_callback(app: "App", query: CallbackQuery) -> None:
         await _handle_preview(app, query, token, argument, pick=(action == "pk"))
         return
 
+    if action == "isg":
+        # Кнопки старого inline-сценария: он больше не используется.
+        await query.answer(_callback_expired(app))
+        return
+
     if action == "sg":
         template_key, field_key = _split_side(argument)
         await _handle_sign_press(app, query, token, template_key, field_key)
-        return
-
-    if action == "isg":
-        template_key, field_key = _split_side(argument)
-        await _handle_inline_sign_press(
-            app, query, token, template_key, field_key
-        )
         return
 
     if action == "cx":
@@ -545,7 +488,7 @@ def _resolve_contract(
         if not contract.inline_message_id:
             app.store.bind_inline(contract, inline_id)
             return contract
-        # Тот же inline-результат отправлен во второй чат: у копии своя жизнь.
+        # Тот же бланк отправлен во второй чат: у копии своя жизнь.
         contract = None
 
     template = app.config.templates.get(template_key) if template_key else None
@@ -593,6 +536,9 @@ async def _handle_preview(
         # Превью не восстановить: в callback_data только токен.
         await query.answer(_callback_expired(app))
         return
+    if contract.state == STATE_SIGNED:
+        await query.answer(app.config.text("callback.done"))
+        return
 
     templates = app.templates()
     if not templates:
@@ -617,6 +563,14 @@ async def _handle_preview(
 
     contract.template_key = template.key
     contract.page = index
+    if template.has_terms:
+        contract.terms = ""
+        contract.terms_user_id = query.from_user.id
+        contract.state = STATE_TERMS
+        ok = await app.edit_terms_prompt(contract, template)
+        await query.answer("" if ok else app.config.text("errors.generic"))
+        return
+
     ok = await app.show_contract(contract, template)
     await query.answer("" if ok else app.config.text("errors.no_templates"))
 
@@ -642,6 +596,9 @@ async def _handle_sign_press(
         await query.answer(app.config.text("errors.generic"))
         return
 
+    if contract.state == STATE_TERMS:
+        await query.answer(app.config.text("callback.terms_first"))
+        return
     if contract.state == STATE_SIGNED:
         await query.answer(app.config.text("callback.done"))
         return
@@ -682,7 +639,7 @@ async def _handle_cancel(app: "App", query: CallbackQuery, token: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# DM
+# DM: commands and the archive only
 # ---------------------------------------------------------------------------
 
 
@@ -696,66 +653,15 @@ async def handle_dm(app: "App", message: Message) -> None:
         await message.answer(reply)
 
     if text.startswith("/"):
-        command, _, argument = text.partition(" ")
+        command, _, _argument = text.partition(" ")
         command = command.split("@", 1)[0].lower()
-        if command == "/start" and argument.startswith(DEEPLINK_PREFIX):
-            await handle_sign_deeplink(app, message, argument, user)
-            return
         if command in {"/start", "/help"}:
             await _dm_greeting(app, message, user, command)
             return
         await _dm_owner_command(app, message, user, command)
         return
 
-    pending = app.store.pending_for(user.id)
-    if pending is not None:
-        await handle_pending_text(app, message, user, text, say)
-        return
-
     await say(app.config.text("dm.nothing_pending", bot=app.bot_username))
-
-
-async def handle_sign_deeplink(
-    app: "App", message: Message, payload: str, user: User
-) -> None:
-    body = payload[len(DEEPLINK_PREFIX):]
-    token, _, field_key = body.partition("_")
-    contract = app.store.get(token)
-    template = app.template_or_first(contract.template_key) if contract else None
-    field = template.fields.get(field_key) if template and field_key else None
-
-    if contract is None or template is None or field is None:
-        await message.answer(app.config.text("dm.link_expired", bot=app.bot_username))
-        return
-    if contract.state == STATE_SIGNED:
-        await message.answer(app.config.text("callback.done"))
-        return
-    if field_key in contract.signatures:
-        await message.answer(
-            app.config.text("guest.already_signed", label=html.escape(field.label))
-        )
-        return
-
-    holder = app.store.pending_holder(contract.token, field_key)
-    if holder is not None and holder != user.id:
-        await message.answer(
-            app.config.text("guest.pending_other", label=html.escape(field.label))
-        )
-        return
-
-    app.store.set_pending(user.id, contract, field_key)
-    await message.answer(
-        ui.dm_sign_prompt(
-            app.config,
-            template,
-            field,
-            app.max_length_for(template),
-            app.bot_username,
-        ),
-        reply_markup=ForceReply(
-            selective=True, input_field_placeholder=app.config.text("dm.reply_placeholder")
-        ),
-    )
 
 
 async def _dm_greeting(app: "App", message: Message, user: User, command: str) -> None:
@@ -807,7 +713,6 @@ async def _dm_owner_command(
         app.config.text(
             "dm.status",
             guest_mode="включён" if app.guest_mode_enabled else "выключен",
-            inline_mode="включён" if app.inline_mode_enabled else "выключен",
             count=len(app.templates()),
             active=app.store.active_count,
             pending=app.store.pending_count,

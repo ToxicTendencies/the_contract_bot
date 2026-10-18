@@ -11,6 +11,7 @@ from app.render import (
     normalize_text,
     render_contract,
     validate_signature,
+    validate_terms,
 )
 from app.config import load_templates
 
@@ -106,3 +107,40 @@ def test_layout_rejects_huge_text():
     )
     tiny = Box(0, 0, 80, 40)
     assert layout_text("Очень длинная подпись", tiny, style) is None
+
+
+def test_validate_terms_accepts_text(config):
+    free = config.templates.get("free")
+    check = validate_terms(
+        "Исполнитель делает макет, Заказчик платит 1000 ₽ до пятницы.", free.terms
+    )
+    assert check.ok, check.error
+    assert check.layout is not None
+
+
+def test_validate_terms_rejects_empty_and_long(config):
+    free = config.templates.get("free")
+    assert validate_terms("   ", free.terms).error == "empty"
+
+    too_long = validate_terms("а" * (free.terms.style.max_length + 1), free.terms)
+    assert not too_long.ok
+    assert too_long.error == "too_long"
+
+
+def test_terms_are_drawn_on_the_blank(config):
+    free = config.templates.get("free")
+    without = render_contract(
+        free,
+        {"party1": "Иванов И.И.", "party2": "Петров П.П."},
+        settings=config.settings.render,
+    )
+    with_terms = render_contract(
+        free,
+        {"party1": "Иванов И.И.", "party2": "Петров П.П."},
+        terms="Оплата 1000 ₽ до пятницы.",
+        settings=config.settings.render,
+    )
+    assert with_terms[:2] == b"\xff\xd8"
+    assert without != with_terms
+    image = Image.open(io.BytesIO(with_terms))
+    assert image.size == (1240, 1754)

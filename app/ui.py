@@ -25,7 +25,7 @@ def _sign_button_text(cfg: ConfigManager, label: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# guest-mode keyboards (in-chat signing)
+# keyboards (everything happens in the chat)
 # ---------------------------------------------------------------------------
 
 
@@ -75,59 +75,6 @@ def signed_buttons_markup(
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-# ---------------------------------------------------------------------------
-# inline-mode keyboards (the button opens the bot's DM)
-# ---------------------------------------------------------------------------
-
-
-def inline_sign_markup(
-    cfg: ConfigManager, token: str, template: TemplateConfig
-) -> InlineKeyboardMarkup:
-    """Buttons shown on the inline result.
-
-    They are callback buttons on purpose: pressing one always delivers
-    ``inline_message_id`` to the bot, so we can edit the message later even
-    when inline feedback is disabled in BotFather.
-    """
-    rows: list[list[InlineKeyboardButton]] = []
-    row: list[InlineKeyboardButton] = []
-    for field in template.fields.values():
-        row.append(
-            InlineKeyboardButton(
-                text=_sign_button_text(cfg, field.label),
-                callback_data=f"isg:{token}:{template.key}:{field.key}",
-            )
-        )
-        if len(row) == 2:
-            rows.append(row)
-            row = []
-    if row:
-        rows.append(row)
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-def inline_signed_markup(
-    cfg: ConfigManager, token: str, template: TemplateConfig, signed: set[str]
-) -> InlineKeyboardMarkup:
-    """Same as inline_sign_markup, but marks the sides that already signed."""
-    rows: list[list[InlineKeyboardButton]] = []
-    row: list[InlineKeyboardButton] = []
-    for field in template.fields.values():
-        if field.key in signed:
-            text = _trim(_q(cfg, "buttons.signed", label=field.label))
-            data = f"no:{token}"
-        else:
-            text = _sign_button_text(cfg, field.label)
-            data = f"isg:{token}:{template.key}:{field.key}"
-        row.append(InlineKeyboardButton(text=text, callback_data=data))
-        if len(row) == 2:
-            rows.append(row)
-            row = []
-    if row:
-        rows.append(row)
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
 def empty_markup() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[])
 
@@ -158,31 +105,11 @@ def contract_caption(cfg: ConfigManager, template: TemplateConfig, max_length: i
     )
 
 
-def inline_caption(cfg: ConfigManager, template: TemplateConfig, max_length: int) -> str:
-    """Caption of the inline result — the message people see in the chat."""
-    data = {
-        "title": html.escape(template.inline_name),
-        "description": html.escape(template.inline_hint),
-        "max_length": max_length,
-    }
-    if template.inline_hint:
-        return _q(cfg, "inline.result_caption", **data)
-    return _q(cfg, "inline.result_caption_short", **data)
-
-
-def inline_progress_caption(
-    cfg: ConfigManager,
-    template: TemplateConfig,
-    label: str,
-    remaining: str,
-    max_length: int,
-) -> str:
+def terms_prompt(cfg: ConfigManager, template: TemplateConfig, max_length: int) -> str:
     return _q(
         cfg,
-        "inline.progress_caption",
-        title=html.escape(template.inline_name),
-        label=html.escape(label),
-        remaining=html.escape(remaining),
+        "guest.terms_prompt",
+        title=html.escape(template.title),
         max_length=max_length,
     )
 
@@ -206,30 +133,13 @@ def sign_prompt_caption(
     )
 
 
-def dm_sign_prompt(
-    cfg: ConfigManager,
-    template: TemplateConfig,
-    field: FieldConfig,
-    max_length: int,
-    bot_username: str,
-) -> str:
-    return _q(
-        cfg,
-        "dm.sign_prompt",
-        label=html.escape(field.label),
-        title=html.escape(template.inline_name),
-        max_length=max_length,
-        bot=bot_username,
-    )
-
-
 def done_caption(
     cfg: ConfigManager,
     template: TemplateConfig,
     self_signed: bool,
     note: str,
 ) -> str:
-    title = html.escape(template.inline_name if template.inline_title else template.title)
+    title = html.escape(template.title)
     if self_signed:
         return _q(cfg, "guest.done_self_caption", title=title, note=html.escape(note))
     return _q(cfg, "guest.done_caption", title=title)
@@ -270,10 +180,17 @@ def owner_caption(
             )
         )
     signers = "\n".join(lines) if lines else _q(cfg, "archive.no_signers")
-    return _q(
+    caption = _q(
         cfg,
         "archive.caption",
         title=html.escape(template.title),
         signers=signers,
         source=html.escape(source),
     )
+    if contract.terms:
+        caption += "\n\n" + _q(
+            cfg,
+            "archive.terms_line",
+            terms=html.escape(contract.terms[:400]),
+        )
+    return caption

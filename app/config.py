@@ -361,6 +361,14 @@ class NoteConfig:
 
 
 @dataclass(frozen=True)
+class TermsConfig:
+    """Свободный блок условий: прямоугольник на бланке и стиль текста."""
+
+    box: Box
+    style: TextStyle
+
+
+@dataclass(frozen=True)
 class TemplateConfig:
     key: str
     file: Path
@@ -369,30 +377,25 @@ class TemplateConfig:
     tags: tuple[str, ...]
     fields: dict[str, FieldConfig]
     note: NoteConfig | None
+    terms: TermsConfig | None = None
     sort: int = 0
-    inline_title: str = ""
-    inline_description: str = ""
     keywords: tuple[str, ...] = ()
 
     @property
-    def inline_name(self) -> str:
-        """Title shown in the inline carousel."""
-        return self.inline_title or self.title
+    def has_terms(self) -> bool:
+        return self.terms is not None
 
     @property
-    def inline_hint(self) -> str:
-        """Subtitle shown under the inline title."""
-        return self.inline_description or self.description
+    def terms_max_length(self) -> int:
+        return self.terms.style.max_length if self.terms is not None else 0
 
     @property
     def search_terms(self) -> tuple[str, ...]:
-        """Everything the inline search matches against, lower-cased."""
+        """Everything the word search matches against, lower-cased."""
         terms = [
             self.key,
             self.title,
             self.description,
-            self.inline_title,
-            self.inline_description,
             *self.tags,
             *self.keywords,
         ]
@@ -528,6 +531,9 @@ def _style_from(
     limits: Limits,
     name: str,
     strict: bool,
+    *,
+    max_length_cap: int = 512,
+    max_lines_cap: int = 10,
 ) -> TextStyle:
     data = dict(defaults)
     data.update({key: value for key, value in raw.items() if key in STYLE_KEYS})
@@ -565,14 +571,14 @@ def _style_from(
         f"{name}.max_length",
         minimum=1,
     )
-    if max_length > 512:
+    if max_length > max_length_cap:
         raise ConfigError(f"{name}.max_length: слишком много ({max_length})")
 
     max_lines = _as_int(
         data.get("max_lines", limits.max_lines), f"{name}.max_lines", minimum=1
     )
-    if max_lines > 10:
-        raise ConfigError(f"{name}.max_lines: максимум 10")
+    if max_lines > max_lines_cap:
+        raise ConfigError(f"{name}.max_lines: максимум {max_lines_cap}")
 
     min_font_scale = _as_float(
         data.get("min_font_scale", limits.min_font_scale),
@@ -782,8 +788,50 @@ def load_templates(
             log.error("%s", message)
             continue
 
-        inline_raw = _mapping(template_raw.get("inline"), f"templates.{key}.inline")
-        keywords_raw = inline_raw.get("keywords", template_raw.get("keywords", [])) or []
+        terms: TermsConfig | None = None
+        terms_raw = template_raw.get("terms")
+        if isinstance(terms_raw, dict) and terms_raw.get("enabled", True) is not False:
+            try:
+                terms_box = parse_box(terms_raw.get("box"), f"templates.{key}.terms.box")
+                if (
+                    terms_box.x < 0
+                    or terms_box.y < 0
+                    or terms_box.right > width
+                    or terms_box.bottom > height
+                ):
+                    raise ConfigError(
+                        f"templates.{key}.terms.box выходит за картинку "
+                        f"{width}x{height}: {terms_box}"
+                    )
+                terms_defaults = dict(defaults)
+                terms_defaults.update(
+                    {
+                        "max_length": 600,
+                        "max_lines": 16,
+                        "min_font_scale": 0.5,
+                        "line_spacing": 1.35,
+                        "align": "left",
+                        "valign": "top",
+                    }
+                )
+                terms_style = _style_from(
+                    terms_raw,
+                    terms_defaults,
+                    fonts,
+                    limits,
+                    f"templates.{key}.terms",
+                    strict,
+                    max_length_cap=1000,
+                    max_lines_cap=24,
+                )
+                terms = TermsConfig(box=terms_box, style=terms_style)
+            except ConfigError as exc:
+                if strict:
+                    raise
+                warnings.append(str(exc))
+                log.error("%s", exc)
+
+        keywords_raw = template_raw.get("keywords", []) or []
         if not isinstance(keywords_raw, (list, tuple)):
             keywords_raw = [keywords_raw]
 
@@ -796,9 +844,8 @@ def load_templates(
                 tags=tuple(str(tag) for tag in template_raw.get("tags", []) or []),
                 fields=fields,
                 note=note,
+                terms=terms,
                 sort=sort_value,
-                inline_title=str(inline_raw.get("title", "")),
-                inline_description=str(inline_raw.get("description", "")),
                 keywords=tuple(str(word) for word in keywords_raw if str(word).strip()),
             )
         )
@@ -929,49 +976,36 @@ def required_text_keys() -> Iterable[str]:
         "dm.reload_failed",
         "dm.status",
         "dm.unknown_dm",
-        "inline.result_caption",
-        "inline.result_caption_short",
-        "inline.opening_dm",
-        "inline.progress_caption",
-        "inline.nothing_found_title",
-        "inline.nothing_found_description",
-        "inline.uploading_title",
-        "inline.uploading_description",
-        "dm.sign_prompt",
-        "dm.reply_placeholder",
-        "dm.sign_saved",
-        "dm.sign_complete",
         "dm.nothing_pending",
-        "dm.link_expired",
-        "dm.prompt_expired",
-        "dm.inline_mode_disabled",
-        "dm.no_modes_enabled",
-        "dm.guest_mode_disabled",
         "archive.caption",
         "archive.signer_line",
         "archive.no_signers",
+        "archive.terms_line",
         "guest.preview_caption",
         "guest.preview_caption_no_description",
         "guest.contract_caption",
+        "guest.terms_prompt",
+        "guest.terms_empty",
+        "guest.terms_too_long",
+        "guest.terms_does_not_fit",
+        "guest.terms_not_yours",
         "guest.sign_prompt",
         "guest.sign_prompt_anonymous",
         "guest.one_signed",
         "guest.done_caption",
         "guest.done_self_caption",
         "guest.self_sign_note",
-        "guest.self_sign_note_caption",
+        "guest.sign_saved",
+        "guest.sign_complete",
         "guest.too_long",
         "guest.empty",
         "guest.does_not_fit",
         "guest.text_only",
         "guest.no_commands",
         "guest.not_pending",
-        "guest.pending_expired",
         "guest.pending_other",
         "guest.unknown_query",
         "guest.already_signed",
-        "guest.cancel_done",
-        "guest.cancelled_by_other",
         "guest.render_failed",
         "guest.upload_failed",
         "guest.contract_expired",
@@ -983,12 +1017,12 @@ def required_text_keys() -> Iterable[str]:
         "buttons.sign",
         "buttons.signed",
         "buttons.cancel",
-        "buttons.retry",
         "callback.expired",
         "callback.done",
+        "callback.signed",
         "callback.already_signed",
         "callback.waiting",
-        "callback.pick_first",
+        "callback.terms_first",
         "callback.cancelled",
         "callback.not_yours",
         "errors.generic",

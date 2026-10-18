@@ -41,7 +41,8 @@ class PendingSignature:
     token: str
     field_key: str
     user_id: int
-    deadline: float
+    chat_key: str | None = None
+    deadline: float = 0.0
 
     def expired(self, now: float | None = None) -> bool:
         return (now or time.time()) > self.deadline
@@ -109,7 +110,9 @@ class ContractStore:
         self._by_token: dict[str, Contract] = {}
         self._chat_tokens: dict[str, list[str]] = {}
         self._by_inline: dict[str, str] = {}
-        self._pending: dict[int, PendingSignature] = {}
+        # Один человек может подписывать контракты в нескольких чатах сразу,
+        # поэтому ожидание ввода привязано к контракту, а не только к юзеру.
+        self._pending: dict[tuple[int, str], PendingSignature] = {}
 
     # -- lookups ---------------------------------------------------------
 
@@ -132,14 +135,53 @@ class ContractStore:
         token = self._by_inline.get(inline_message_id)
         return self._by_token.get(token) if token else None
 
-    def pending_for(self, user_id: int) -> PendingSignature | None:
-        pending = self._pending.get(user_id)
-        if pending is None:
+    def for_message(self, chat_key: str, message_id: int | None) -> Contract | None:
+        """Контракт чата, привязанный к конкретному сообщению бота."""
+        if not message_id:
             return None
-        if pending.expired():
-            self._pending.pop(user_id, None)
+        for token in reversed(self._chat_tokens.get(chat_key, [])):
+            contract = self._by_token.get(token)
+            if contract is not None and contract.message_id == message_id:
+                return contract
+        return None
+
+    def pending_for(
+        self,
+        user_id: int,
+        chat_key: str | None = None,
+        *,
+        token: str | None = None,
+    ) -> PendingSignature | None:
+        """Ожидание ввода: в этом чате, по токену или самое свежее.
+
+        ``chat_key`` не даёт ответу в одном чате подписать контракт другого.
+        Контракты, восстановленные после рестарта, могут не знать свой чат —
+        такие ожидания подходят только как запасной вариант.
+        """
+        if token is not None:
+            pending = self._pending.get((user_id, token))
+            if pending is not None and pending.expired():
+                self._pending.pop((user_id, token), None)
+                return None
+            return pending
+
+        now = time.time()
+        live: list[PendingSignature] = []
+        for key, pending in list(self._pending.items()):
+            if pending.expired(now):
+                self._pending.pop(key, None)
+                continue
+            if pending.user_id == user_id:
+                live.append(pending)
+        if not live:
             return None
-        return pending
+        if chat_key is None:
+            return max(live, key=lambda item: item.deadline)
+        exact = [item for item in live if item.chat_key == chat_key]
+        if exact:
+            return max(exact, key=lambda item: item.deadline)
+        unknown = [item for item in live if item.chat_key is None]
+        return max(unknown, key=lambda item: item.deadline) if unknown else None
 
     def terms_for_user(self, user_id: int, chat_key: str) -> Contract | None:
         """Контракт в этом чате, который ждёт условия от этого пользователя."""
@@ -156,12 +198,12 @@ class ContractStore:
     def pending_holder(self, token: str, field_key: str) -> int | None:
         """Who is currently typing a signature for this field, if anyone."""
         now = time.time()
-        for user_id, pending in list(self._pending.items()):
+        for key, pending in list(self._pending.items()):
             if pending.expired(now):
-                self._pending.pop(user_id, None)
+                self._pending.pop(key, None)
                 continue
             if pending.token == token and pending.field_key == field_key:
-                return user_id
+                return pending.user_id
         return None
 
     @property
@@ -214,10 +256,14 @@ class ContractStore:
     def _trim_chat(self, chat_key: str) -> None:
         tokens = self._chat_tokens.get(chat_key, [])
         while len(tokens) > self.max_per_chat:
-            oldest = tokens.pop(0)
-            contract = self._by_token.get(oldest)
-            if contract is not None:
-                self.drop(contract)
+            live = [token for token in tokens if token in self._by_token]
+            if not live:
+                break
+            # Сначала расстаёмся с пустыми бланками: в подписанных уже есть
+            # работа людей, и терять её из-за нового вызова бота нельзя.
+            empty = [token for token in live if not self._by_token[token].signatures]
+            victim = empty[0] if empty else live[0]
+            self.drop(self._by_token[victim])
 
     def bind_inline(self, contract: Contract, inline_message_id: str) -> None:
         contract.inline_message_id = inline_message_id
@@ -237,9 +283,7 @@ class ContractStore:
             and self._by_inline.get(contract.inline_message_id) == contract.token
         ):
             self._by_inline.pop(contract.inline_message_id, None)
-        for user_id, pending in list(self._pending.items()):
-            if pending.token == contract.token:
-                self._pending.pop(user_id, None)
+        self.clear_pending(token=contract.token)
 
     def drop_token(self, token: str | None) -> None:
         contract = self.get(token)
@@ -257,21 +301,29 @@ class ContractStore:
     def set_pending(
         self, user_id: int, contract: Contract, field_key: str
     ) -> PendingSignature:
+        # Нажатие на другую сторону того же контракта заменяет ожидание,
+        # но нажатие в другом чате или на другом бланке его не трогает.
         pending = PendingSignature(
             token=contract.token,
             field_key=field_key,
             user_id=user_id,
+            chat_key=contract.chat_key,
             deadline=time.time() + self.pending_seconds,
         )
-        self._pending[user_id] = pending
+        self._pending[(user_id, contract.token)] = pending
         contract.touch()
         return pending
 
-    def clear_pending(self, user_id: int | None = None) -> None:
-        if user_id is None:
+    def clear_pending(self, user_id: int | None = None, token: str | None = None) -> None:
+        if user_id is None and token is None:
             self._pending.clear()
-        else:
-            self._pending.pop(user_id, None)
+            return
+        for key, pending in list(self._pending.items()):
+            if user_id is not None and pending.user_id != user_id:
+                continue
+            if token is not None and pending.token != token:
+                continue
+            self._pending.pop(key, None)
 
     def pending_for_contract(self, token: str) -> list[PendingSignature]:
         return [pending for pending in self._pending.values() if pending.token == token]
@@ -279,10 +331,10 @@ class ContractStore:
     def expire_pending(self, now: float | None = None) -> list[PendingSignature]:
         now = now or time.time()
         expired: list[PendingSignature] = []
-        for user_id, pending in list(self._pending.items()):
+        for key, pending in list(self._pending.items()):
             if pending.expired(now):
                 expired.append(pending)
-                self._pending.pop(user_id, None)
+                self._pending.pop(key, None)
         return expired
 
     # -- signatures ------------------------------------------------------
@@ -306,7 +358,7 @@ class ContractStore:
             at=time.time(),
         )
         contract.signatures[field_key] = signature
-        self.clear_pending(user_id)
+        self.clear_pending(user_id, contract.token)
         contract.touch()
         return signature
 
@@ -319,9 +371,9 @@ class ContractStore:
         for contract in ordered[: len(self._by_token) - self.max_active]:
             self.drop(contract)
         now = time.time()
-        for user_id, pending in list(self._pending.items()):
+        for key, pending in list(self._pending.items()):
             if pending.expired(now) or self.get(pending.token) is None:
-                self._pending.pop(user_id, None)
+                self._pending.pop(key, None)
 
     def pop_stale(self, now: float | None = None) -> list[Contract]:
         """Remove and return contracts that sat idle for longer than TTL."""

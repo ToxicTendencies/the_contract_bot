@@ -70,6 +70,51 @@ def test_pending_expires():
     assert store.pending_for(10) is None
 
 
+def test_pending_is_per_contract_and_chat():
+    """Один человек может подписывать контракты в разных чатах одновременно."""
+    store = make_store()
+    a = store.create(chat_key="g1", template_key="classic", initiator_id=10)
+    b = store.create(chat_key="g2", template_key="classic", initiator_id=10)
+    pending_a = store.set_pending(10, a, "party1")
+    pending_b = store.set_pending(10, b, "party1")
+
+    assert store.pending_for(10, "g1") is pending_a
+    assert store.pending_for(10, "g2") is pending_b
+    assert store.pending_for(10, token=a.token) is pending_a
+    assert store.pending_for(10, "g3") is None
+    assert store.pending_for(10) in (pending_a, pending_b)
+
+    store.clear_pending(10, a.token)
+    assert store.pending_for(10, "g1") is None
+    assert store.pending_for(10, "g2") is pending_b
+
+
+def test_drop_clears_only_its_own_pending():
+    store = make_store()
+    a = store.create(chat_key="g1", template_key="classic", initiator_id=10)
+    b = store.create(chat_key="g2", template_key="classic", initiator_id=10)
+    store.set_pending(10, a, "party1")
+    pending_b = store.set_pending(10, b, "party1")
+
+    store.drop(a)
+    assert store.pending_for(10) is pending_b
+
+
+def test_trim_keeps_contracts_with_signatures():
+    """Лимит чата не должен стирать уже подписанный бланк."""
+    store = make_store()
+    signed = store.create(chat_key="g1", template_key="classic", initiator_id=10)
+    store.add_signature(signed, field_key="party1", text="A", user_id=10)
+    empty = [
+        store.create(chat_key="g1", template_key="classic", initiator_id=10)
+        for _ in range(store.max_per_chat)
+    ]
+
+    assert store.get(signed.token) is signed
+    assert store.get(empty[0].token) is None
+    assert len(store._chat_tokens["g1"]) == store.max_per_chat
+
+
 def test_pending_not_expired_yet():
     store = make_store()
     contract = store.create(chat_key="g1", template_key="classic", initiator_id=10)

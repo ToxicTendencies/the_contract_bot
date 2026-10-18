@@ -166,7 +166,7 @@ async def test_stale_prompt_restores_chat_view(app, monkeypatch):
     contract.inline_message_id = "inline-1"
     contract.state = STATE_OPEN
     app.store.set_pending(55, contract, "party1")
-    app.store._pending[55].deadline -= app.store.pending_seconds + 1
+    app.store._pending[(55, contract.token)].deadline -= app.store.pending_seconds + 1
 
     edits: list[dict] = []
     sent: list[tuple[int, str]] = []

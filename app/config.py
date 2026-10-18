@@ -1003,6 +1003,7 @@ def required_text_keys() -> Iterable[str]:
         "guest.text_only",
         "guest.no_commands",
         "guest.not_pending",
+        "guest.pending_elsewhere",
         "guest.pending_other",
         "guest.unknown_query",
         "guest.already_signed",

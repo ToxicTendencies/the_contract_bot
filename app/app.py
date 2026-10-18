@@ -331,7 +331,9 @@ class App:
             ui.contract_caption(
                 self.config, template, self.max_length_for(template)
             ),
-            ui.contract_markup(self.config, contract.token, template),
+            ui.signed_buttons_markup(
+                self.config, contract.token, template, set(contract.signatures)
+            ),
         )
 
     # -- editing ----------------------------------------------------------
@@ -412,7 +414,11 @@ class App:
             ui.sign_prompt_caption(
                 self.config, field, user_name, self.max_length_for(template)
             ),
-            ui.contract_markup(self.config, contract.token, template),
+            # Уже подписанные стороны остаются с галочкой: иначе второму
+            # участнику кажется, что прогресс сбросился.
+            ui.signed_buttons_markup(
+                self.config, contract.token, template, set(contract.signatures)
+            ),
         )
 
     async def show_signed_progress(

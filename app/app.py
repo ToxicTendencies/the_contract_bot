@@ -7,6 +7,7 @@ import html
 import logging
 import secrets
 import time
+from collections import deque
 from typing import Iterable
 
 from aiogram import Bot, Dispatcher
@@ -59,6 +60,9 @@ class App:
         self.started_at = time.time()
         self._cleanup_task: asyncio.Task[None] | None = None
         self._warmup_lock = asyncio.Lock()
+        # Короткая история событий: /debug показывает её владельцу, когда
+        # «в чате что-то не так», а доступа к логам сервера нет.
+        self.events: deque[str] = deque(maxlen=120)
 
         # Imported lazily to avoid a circular import at module load time.
         from .handlers import build_router
@@ -134,6 +138,27 @@ class App:
     async def ensure_templates_ready(self) -> tuple[int, int]:
         async with self._warmup_lock:
             return await self.storage.warmup(self.bot)
+
+    # -- diagnostics -------------------------------------------------------
+
+    def note(self, event: str) -> None:
+        self.events.append(f"{time.strftime('%H:%M:%S')} {event}")
+
+    def recent_events(self, limit: int = 40) -> list[str]:
+        return list(self.events)[-limit:]
+
+    def contracts_report(self) -> list[str]:
+        lines: list[str] = []
+        for contract in self.store.contracts():
+            pending = len(self.store.pending_for_contract(contract.token))
+            signed = ",".join(contract.signatures) or "-"
+            inline = (contract.inline_message_id or "-")[:20]
+            lines.append(
+                f"{contract.token} {contract.state} chat={contract.chat_key or '-'} "
+                f"tmpl={contract.template_key} inline={inline} "
+                f"msg={contract.message_id or '-'} signed={signed} pending={pending}"
+            )
+        return lines
 
     # -- template helpers -------------------------------------------------
 
@@ -230,8 +255,8 @@ class App:
             if not inline_id:
                 log.warning("Guest-ответ пришёл без inline_message_id")
                 return False
-            contract.inline_message_id = inline_id
-            contract.touch()
+            # bind_inline снимает старую привязку: карточка переехала.
+            self.store.bind_inline(contract, inline_id)
             return True
 
         try:
@@ -250,6 +275,92 @@ class App:
         contract.message_id = getattr(sent, "message_id", None)
         contract.touch()
         return True
+
+    async def repost_contract(
+        self, message: Message, contract: Contract, template: TemplateConfig
+    ) -> bool:
+        """Показать текущий контракт новым сообщением, а старое погасить.
+
+        Старая карточка может уехать далеко вверх, поэтому повторное
+        упоминание переносит контракт вниз: токен, условия и подписи те же,
+        а прежнее сообщение становится указателем «продолжение ниже».
+        """
+        old_inline = contract.inline_message_id
+        old_chat, old_message = contract.chat_id, contract.message_id
+
+        if contract.state == STATE_OPEN:
+            file_id = contract.blank_file_id or self.storage.file_id(template.key)
+            if not file_id:
+                return False
+            ok = await self.reply_with_photo(
+                message,
+                contract,
+                template,
+                ui.contract_caption(
+                    self.config, template, self.max_length_for(template)
+                ),
+                ui.signed_buttons_markup(
+                    self.config, contract.token, template, set(contract.signatures)
+                ),
+                file_id=file_id,
+            )
+        elif contract.state == STATE_TERMS and template.terms is not None:
+            ok = await self.reply_with_photo(
+                message,
+                contract,
+                template,
+                ui.terms_prompt(self.config, template, template.terms_max_length),
+                None,
+            )
+        else:
+            templates = self.templates()
+            if not templates:
+                return False
+            index = self.clamp_index(contract.page, len(templates))
+            shown = templates[index]
+            contract.page = index
+            ok = await self.reply_with_photo(
+                message,
+                contract,
+                shown,
+                ui.preview_caption(self.config, shown, index, len(templates)),
+                ui.preview_markup(self.config, contract.token, index, len(templates)),
+                file_id=self.storage.file_id(shown.key),
+            )
+
+        if not ok:
+            contract.inline_message_id = old_inline
+            contract.chat_id, contract.message_id = old_chat, old_message
+            return False
+
+        await self._retire_card(old_inline, old_chat, old_message)
+        return True
+
+    async def _retire_card(
+        self,
+        inline_message_id: str | None,
+        chat_id: int | None,
+        message_id: int | None,
+    ) -> None:
+        """Пометить старое сообщение указателем на новое, убрав кнопки."""
+        target: dict[str, object] = {}
+        if inline_message_id:
+            target["inline_message_id"] = inline_message_id
+        elif chat_id and message_id:
+            target["chat_id"] = chat_id
+            target["message_id"] = message_id
+        else:
+            return
+        self.store.unbind_inline(inline_message_id)
+        try:
+            await self.bot.edit_message_caption(
+                caption=self.config.text("guest.continued"),
+                parse_mode=ParseMode.HTML,
+                reply_markup=ui.empty_markup(),
+                **target,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.info("Не удалось пометить старый бланк: %s", exc)
 
     async def send_preview(
         self, message: Message, contract: Contract, template: TemplateConfig

@@ -135,6 +135,14 @@ class ContractStore:
         token = self._by_inline.get(inline_message_id)
         return self._by_token.get(token) if token else None
 
+    def open_for_chat(self, chat_key: str) -> Contract | None:
+        """Незавершённый контракт чата: его продолжают новым сообщением."""
+        for token in reversed(self._chat_tokens.get(chat_key, [])):
+            contract = self._by_token.get(token)
+            if contract is not None and contract.state != STATE_SIGNED:
+                return contract
+        return None
+
     def for_message(self, chat_key: str, message_id: int | None) -> Contract | None:
         """Контракт чата, привязанный к конкретному сообщению бота."""
         if not message_id:
@@ -206,6 +214,26 @@ class ContractStore:
                 return pending.user_id
         return None
 
+    def unique_pending(self, user_id: int) -> PendingSignature | None:
+        """Единственное ожидание ввода у человека — если их ровно одно.
+
+        Нужно как запасной вариант для ответов, у которых не совпал ключ чата
+        (тема форума, guest-контекст): подписывать «наугад» чужой контракт
+        нельзя, а при одном ожидании ошибиться негде.
+        """
+        now = time.time()
+        live: list[PendingSignature] = []
+        for key, pending in list(self._pending.items()):
+            if pending.expired(now):
+                self._pending.pop(key, None)
+                continue
+            if pending.user_id == user_id:
+                live.append(pending)
+        return live[0] if len(live) == 1 else None
+
+    def contracts(self) -> list[Contract]:
+        return list(self._by_token.values())
+
     @property
     def active_count(self) -> int:
         return len(self._by_token)
@@ -266,8 +294,34 @@ class ContractStore:
             self.drop(self._by_token[victim])
 
     def bind_inline(self, contract: Contract, inline_message_id: str) -> None:
+        if (
+            contract.inline_message_id
+            and contract.inline_message_id != inline_message_id
+        ):
+            self._by_inline.pop(contract.inline_message_id, None)
         contract.inline_message_id = inline_message_id
         self._by_inline[inline_message_id] = contract.token
+        contract.touch()
+
+    def unbind_inline(self, inline_message_id: str | None) -> None:
+        if inline_message_id:
+            self._by_inline.pop(inline_message_id, None)
+
+    def bind_message(
+        self,
+        contract: Contract,
+        *,
+        chat_id: int,
+        message_id: int,
+        chat_key: str | None = None,
+    ) -> None:
+        """Переключить правки на обычное сообщение бота (бот в чате)."""
+        self.unbind_inline(contract.inline_message_id)
+        contract.inline_message_id = None
+        contract.chat_id = chat_id
+        contract.message_id = message_id
+        if chat_key:
+            contract.chat_key = chat_key
         contract.touch()
 
     def drop(self, contract: Contract) -> None:
@@ -284,6 +338,18 @@ class ContractStore:
         ):
             self._by_inline.pop(contract.inline_message_id, None)
         self.clear_pending(token=contract.token)
+
+    def drop_chat(self, chat_key: str, keep: str | None = None) -> list[Contract]:
+        """Забыть прежние контракты чата: живёт только последний."""
+        dropped: list[Contract] = []
+        for token in list(self._chat_tokens.get(chat_key, [])):
+            if keep is not None and token == keep:
+                continue
+            contract = self._by_token.get(token)
+            if contract is not None:
+                dropped.append(contract)
+                self.drop(contract)
+        return dropped
 
     def drop_token(self, token: str | None) -> None:
         contract = self.get(token)

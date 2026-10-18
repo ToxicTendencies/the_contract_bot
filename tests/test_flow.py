@@ -311,3 +311,18 @@ async def test_dm_status_owner(app):
     message = FakeDM("/status", user_id=app.settings.owner_id)
     await handle_dm(app, message)
     assert message.answers and "Guest Mode" in message.answers[0]
+
+
+@pytest.mark.asyncio
+async def test_dm_debug_owner_only(app):
+    from app.handlers import handle_dm
+
+    stranger = FakeDM("/debug", user_id=777)
+    await handle_dm(app, stranger)
+    assert stranger.answers == [app.config.text("dm.owner_only")]
+
+    owner = FakeDM("/debug", user_id=app.settings.owner_id)
+    await handle_dm(app, owner)
+    assert owner.answers
+    assert "Отладка" in owner.answers[0]
+    assert "Последние события" in owner.answers[0]

@@ -27,7 +27,13 @@ from aiogram.types import CallbackQuery, Message, User
 
 from .config import TemplateConfig
 from .render import validate_signature, validate_terms
-from .store import STATE_SIGNED, STATE_TERMS, Contract, chat_key
+from .store import (
+    STATE_SIGNED,
+    STATE_TERMS,
+    Contract,
+    PendingSignature,
+    chat_key,
+)
 
 if TYPE_CHECKING:  # pragma: no cover
     from .app import App
@@ -52,6 +58,17 @@ def split_mention(text: str, username: str) -> tuple[str, bool]:
 
 def _chat_key(message: Message) -> str:
     return chat_key(message.chat.id, message.message_thread_id)
+
+
+def _reply_contract(app: "App", message: Message, key: str) -> Contract | None:
+    """Контракт, на сообщение которого ответили (в режиме участника)."""
+    reply = message.reply_to_message
+    if reply is None:
+        return None
+    author = getattr(reply, "from_user", None)
+    if author is None or getattr(author, "id", None) != app.bot_id:
+        return None
+    return app.store.for_message(key, getattr(reply, "message_id", None))
 
 
 def _user_name(user: User) -> str:
@@ -205,18 +222,28 @@ async def apply_signature(
 
 
 async def handle_pending_text(
-    app: "App", message: Message, user: User, text: str, say: Say
+    app: "App",
+    message: Message,
+    user: User,
+    text: str,
+    say: Say,
+    pending: PendingSignature | None = None,
 ) -> None:
-    pending = app.store.pending_for(user.id)
+    key = _chat_key(message)
+    pending = pending if pending is not None else app.store.pending_for(user.id, key)
     if pending is None:
         return
     contract = app.store.get(pending.token)
     if contract is None:
-        app.store.clear_pending(user.id)
+        app.store.clear_pending(user.id, pending.token)
         await say(app.config.text("guest.contract_expired", bot=app.bot_username))
         return
+    if contract.chat_key is not None and contract.chat_key != key:
+        # Ответ пришёл в другой чат: чужой контракт не подписываем,
+        # но ожидание сохраняем — человек ещё может ответить там, где нажал.
+        return
     if contract.state == STATE_SIGNED:
-        app.store.clear_pending(user.id)
+        app.store.clear_pending(user.id, pending.token)
         return
     await apply_signature(app, contract, user, text, say, pending_field=pending.field_key)
 
@@ -279,17 +306,33 @@ async def handle_chat_message(app: "App", message: Message) -> None:
         if reply_author is not None and reply_author.is_bot and not is_reply_to_bot:
             return  # someone is talking to another bot
 
-        pending = app.store.pending_for(user.id)
+        # Ответ на конкретный бланк важнее «последнего действия»: в чате
+        # может жить несколько контрактов, и подпись не должна уехать в соседний.
+        target = _reply_contract(app, message, key)
+        pending: PendingSignature | None = None
+        terms_contract: Contract | None = None
+        if target is not None:
+            pending = app.store.pending_for(user.id, token=target.token)
+            if (
+                pending is None
+                and target.state == STATE_TERMS
+                and target.terms_user_id == user.id
+            ):
+                terms_contract = target
+        if pending is None and terms_contract is None:
+            pending = app.store.pending_for(user.id, key)
+        if pending is None and terms_contract is None:
+            terms_contract = app.store.terms_for_user(user.id, key)
+
         if pending is not None:
             if not accept_input:
                 return
             if not text:
                 await say(app.config.text("guest.text_only"))
                 return
-            await handle_pending_text(app, message, user, text, say)
+            await handle_pending_text(app, message, user, text, say, pending=pending)
             return
 
-        terms_contract = app.store.terms_for_user(user.id, key)
         if terms_contract is not None:
             if not accept_input:
                 return
@@ -303,6 +346,10 @@ async def handle_chat_message(app: "App", message: Message) -> None:
             return
         contract = app.store.for_chat(key)
         if contract is None:
+            return
+        if app.store.pending_for(user.id) is not None:
+            # Подпись уже начата в другом чате — не подписываем этот молча.
+            await say(app.config.text("guest.pending_elsewhere"))
             return
         if contract.state == STATE_TERMS:
             await say(app.config.text("guest.terms_not_yours"))
@@ -335,9 +382,9 @@ async def handle_chat_message(app: "App", message: Message) -> None:
     if query:
         template = app.config.templates.find(query)
         if template is None:
-            pending = app.store.pending_for(user.id)
+            pending = app.store.pending_for(user.id, key)
             if pending is not None and accept_input:
-                await handle_pending_text(app, message, user, query, say)
+                await handle_pending_text(app, message, user, query, say, pending=pending)
                 return
             terms_contract = app.store.terms_for_user(user.id, key)
             if terms_contract is not None and accept_input:
@@ -630,8 +677,7 @@ async def _handle_cancel(app: "App", query: CallbackQuery, token: str) -> None:
         await query.answer(app.config.text("callback.not_yours"))
         return
 
-    for pending in app.store.pending_for_contract(contract.token):
-        app.store.clear_pending(pending.user_id)
+    app.store.clear_pending(token=contract.token)
     template = app.template_or_first(contract.template_key)
     if template is not None:
         await app.restore_contract_view(contract, template)

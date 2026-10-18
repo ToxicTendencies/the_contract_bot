@@ -126,16 +126,22 @@ async def press(app, data: str, user: FakeUser, inline_id: str | None = None):
     return query
 
 
-def reply_to_bot(text: str, user: FakeUser, contract, *, query_id: str = "reply"):
+def reply_to_bot(
+    text: str,
+    user: FakeUser,
+    contract,
+    *,
+    query_id: str = "reply",
+    chat: FakeChat | None = None,
+    message_id: int | None = None,
+):
     """A guest message that answers the bot's contract message."""
-    return FakeGuestMessage(
-        text,
-        user,
-        reply_to=types.SimpleNamespace(
-            from_user=FakeUser(999, first_name="Bot", is_bot=True, username="test_bot")
-        ),
-        query_id=query_id,
+    reply = types.SimpleNamespace(
+        from_user=FakeUser(999, first_name="Bot", is_bot=True, username="test_bot")
     )
+    if message_id is not None:
+        reply.message_id = message_id
+    return FakeGuestMessage(text, user, chat=chat, reply_to=reply, query_id=query_id)
 
 
 @pytest.mark.asyncio
@@ -307,7 +313,7 @@ async def test_free_terms_flow(wired):
     assert contract.state == STATE_TERMS
     assert contract.terms_user_id == 10
     prompt = photo_result(summon)
-    assert "Пришли условия" in prompt.caption
+    assert "Ответь на это сообщение условиями" in prompt.caption
 
     # 2. Чужой текст не подхватывается
     stranger = FakeUser(33, first_name="Мимо")
@@ -369,7 +375,7 @@ async def test_terms_can_be_chosen_from_carousel(wired):
     assert pick.answers[-1] == ""
     assert contract.template_key == "free"
     assert contract.state == STATE_TERMS
-    assert "Пришли условия" in bot.edits[-1]["media"].caption
+    assert "Ответь на это сообщение условиями" in bot.edits[-1]["media"].caption
 
 
 # ---------------------------------------------------------------------------
@@ -387,10 +393,12 @@ class FakeChatMessage:
         chat: FakeChat | None = None,
         *,
         reply_to: object | None = None,
+        message_id_base: int = 900,
     ) -> None:
         self.text = text
         self.from_user = user
         self.chat = chat or FakeChat(-100777)
+        self.message_id_base = message_id_base
         self.guest_query_id = None
         self.guest_bot_caller_user = None
         self.guest_bot_caller_chat = None
@@ -401,7 +409,7 @@ class FakeChatMessage:
 
     async def answer_photo(self, photo, caption="", parse_mode=None, reply_markup=None):
         message = types.SimpleNamespace(
-            chat=self.chat, message_id=900 + len(self.photos)
+            chat=self.chat, message_id=self.message_id_base + len(self.photos)
         )
         self.photos.append(
             {
@@ -494,7 +502,7 @@ async def test_member_mode_terms_flow(wired):
     await handle_chat_message(app, summon)
     contract = app.store.for_chat("g-100777")
     assert contract is not None and contract.state == STATE_TERMS
-    assert "Пришли условия" in summon.photos[0]["caption"]
+    assert "Ответь на это сообщение условиями" in summon.photos[0]["caption"]
 
     await handle_chat_message(
         app,
@@ -542,3 +550,207 @@ async def test_member_mode_buttons_survive_restart(wired, config):
     assert restored.chat_id == -100777
     assert restored.message_id == contract.message_id
     assert fresh_bot.edits[-1]["chat_id"] == -100777
+
+
+# ---------------------------------------------------------------------------
+# несколько чатов и несколько бланков одновременно
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_same_user_signs_in_two_chats(wired):
+    """Подписи в двух чатах не перетирают друг друга."""
+    app, _, _ = wired
+    anna = FakeUser(10, first_name="Аня", username="anna")
+    chat_a, chat_b = FakeChat(-100500), FakeChat(-100777)
+
+    await handle_chat_message(app, FakeGuestMessage("@test_bot", anna, chat_a))
+    first = app.store.for_chat("g-100500")
+    await handle_chat_message(app, FakeGuestMessage("@test_bot", anna, chat_b))
+    second = app.store.for_chat("g-100777")
+    assert first is not None and second is not None
+
+    await press(app, f"sg:{first.token}:classic:party1", anna, first.inline_message_id)
+    await press(app, f"sg:{second.token}:classic:party1", anna, second.inline_message_id)
+
+    # Нажатие во втором чате не должно забирать ожидание из первого
+    assert app.store.pending_for(10, "g-100500").token == first.token
+    assert app.store.pending_for(10, "g-100777").token == second.token
+
+    await handle_chat_message(
+        app, reply_to_bot("Анна в A", anna, first, chat=chat_a)
+    )
+    await handle_chat_message(
+        app, reply_to_bot("Анна в B", anna, second, chat=chat_b)
+    )
+
+    assert first.signatures["party1"].text == "Анна в A"
+    assert second.signatures["party1"].text == "Анна в B"
+
+
+@pytest.mark.asyncio
+async def test_reply_in_other_chat_does_not_sign(wired):
+    """Ответ не в том чате не подписывает контракт и честно об этом говорит."""
+    app, _, _ = wired
+    anna = FakeUser(10, first_name="Аня", username="anna")
+    chat_a, chat_b = FakeChat(-100500), FakeChat(-100777)
+
+    await handle_chat_message(app, FakeGuestMessage("@test_bot", anna, chat_a))
+    first = app.store.for_chat("g-100500")
+    await handle_chat_message(app, FakeGuestMessage("@test_bot", anna, chat_b))
+    second = app.store.for_chat("g-100777")
+    await press(app, f"sg:{first.token}:classic:party1", anna, first.inline_message_id)
+
+    reply = reply_to_bot("Анна А.", anna, second, chat=chat_b)
+    await handle_chat_message(app, reply)
+
+    assert first.signatures == {}
+    assert second.signatures == {}
+    assert "другом чате" in reply.answers[-1].input_message_content.message_text
+
+    # Ожидание не потерялось: ответ в правильном чате по-прежнему подписывает
+    assert app.store.pending_for(10, "g-100500").token == first.token
+    await handle_chat_message(
+        app, reply_to_bot("Анна А.", anna, first, chat=chat_a)
+    )
+    assert first.signatures["party1"].text == "Анна А."
+
+
+@pytest.mark.asyncio
+async def test_older_contract_keeps_its_signature(wired):
+    """Второй бланк в том же чате не крадёт подпись первого."""
+    app, _, _ = wired
+    anna = FakeUser(10, first_name="Аня", username="anna")
+    chat = FakeChat(-100500)
+
+    await handle_chat_message(app, FakeGuestMessage("@test_bot", anna, chat))
+    first = app.store.for_chat("g-100500")
+    await handle_chat_message(app, FakeGuestMessage("@test_bot", anna, chat))
+    second = app.store.for_chat("g-100500")
+    assert first.token != second.token
+
+    await press(app, f"sg:{first.token}:classic:party1", anna, first.inline_message_id)
+    assert first.signatures == {}
+    await handle_chat_message(app, reply_to_bot("Анна А.", anna, first, chat=chat))
+
+    assert first.signatures["party1"].text == "Анна А."
+    assert second.signatures == {}
+
+
+@pytest.mark.asyncio
+async def test_second_signer_sees_signed_side(wired):
+    """После подписи первого участника чужая кнопка не «сбрасывает» бланк."""
+    app, bot, _ = wired
+    anna = FakeUser(10, first_name="Аня", username="anna")
+    boris = FakeUser(20, first_name="Борис")
+
+    await handle_chat_message(app, FakeGuestMessage("@test_bot", anna))
+    contract = app.store.for_chat("g-100500")
+    await press(app, f"pk:{contract.token}:0", anna, contract.inline_message_id)
+    await press(app, f"sg:{contract.token}:classic:party1", anna, contract.inline_message_id)
+    await handle_chat_message(app, reply_to_bot("Анна А.", anna, contract))
+    assert contract.signatures["party1"].text == "Анна А."
+
+    await press(app, f"sg:{contract.token}:classic:party2", boris, contract.inline_message_id)
+    markup = bot.edits[-1]["reply_markup"].inline_keyboard
+    keys = [button.callback_data for row in markup for button in row]
+    texts = [button.text for row in markup for button in row]
+
+    assert f"no:{contract.token}" in keys
+    assert f"sg:{contract.token}:classic:party2" in keys
+    assert "✅ Сторона 1" in texts
+    assert "✍️ Сторона 1" not in texts
+
+
+@pytest.mark.asyncio
+async def test_member_mode_reply_target_wins(wired):
+    """В режиме участника ответ на конкретный бланк важнее «самого нового»."""
+    app, _, _ = wired
+    chat = FakeChat(-100777)
+    anna = FakeUser(10, first_name="Аня", username="anna")
+    bot_user = FakeUser(999, first_name="Bot", is_bot=True, username="test_bot")
+
+    await handle_chat_message(app, FakeChatMessage("@test_bot", anna, chat))
+    first = app.store.for_chat("g-100777")
+    await handle_chat_message(
+        app, FakeChatMessage("@test_bot условия", anna, chat, message_id_base=901)
+    )
+    second = app.store.for_chat("g-100777")
+    assert first.token != second.token and second.message_id == 901
+
+    # Ждём подпись в первом контракте, а условия шлём во второй.
+    await press(app, f"sg:{first.token}:classic:party1", anna)
+    first_reply = FakeChatMessage("Анна А.", anna, chat, reply_to=types.SimpleNamespace(
+        from_user=bot_user, message_id=first.message_id
+    ))
+    terms_reply = FakeChatMessage(
+        "Оплата 500 ₽ после сдачи.",
+        anna,
+        chat,
+        reply_to=types.SimpleNamespace(from_user=bot_user, message_id=second.message_id),
+    )
+
+    await handle_chat_message(app, terms_reply)
+    assert second.terms == "Оплата 500 ₽ после сдачи."
+    assert first.signatures == {}
+    assert app.store.pending_for(10, "g-100777").token == first.token
+
+    await handle_chat_message(app, first_reply)
+    assert first.signatures["party1"].text == "Анна А."
+
+
+@pytest.mark.asyncio
+async def test_member_mode_free_contract_both_sides(wired):
+    """Свободный бланк в чате-участнике: условия, две подписи, финал."""
+    app, bot, storage = wired
+    chat = FakeChat(-100777)
+    anna = FakeUser(10, first_name="Аня", username="anna")
+    boris = FakeUser(20, first_name="Борис")
+    bot_user = FakeUser(999, first_name="Bot", is_bot=True, username="test_bot")
+
+    await handle_chat_message(app, FakeChatMessage("@test_bot условия", anna, chat))
+    contract = app.store.for_chat("g-100777")
+    terms = "Исполнитель делает макет, Заказчик платит 1000 ₽ до пятницы."
+    await handle_chat_message(
+        app,
+        FakeChatMessage(
+            terms,
+            anna,
+            chat,
+            reply_to=types.SimpleNamespace(from_user=bot_user, message_id=contract.message_id),
+        ),
+    )
+    assert contract.terms == terms
+    assert contract.state == STATE_OPEN
+
+    await press(app, f"sg:{contract.token}:free:party1", anna)
+    await handle_chat_message(
+        app,
+        FakeChatMessage(
+            "Анна А.",
+            anna,
+            chat,
+            reply_to=types.SimpleNamespace(from_user=bot_user, message_id=contract.message_id),
+        ),
+    )
+    assert contract.signatures["party1"].text == "Анна А."
+
+    await press(app, f"sg:{contract.token}:free:party2", boris)
+    await handle_chat_message(
+        app,
+        FakeChatMessage(
+            "Борис Б.",
+            boris,
+            chat,
+            reply_to=types.SimpleNamespace(from_user=bot_user, message_id=contract.message_id),
+        ),
+    )
+
+    assert contract.state == STATE_SIGNED
+    assert {key: sig.text for key, sig in contract.signatures.items()} == {
+        "party1": "Анна А.",
+        "party2": "Борис Б.",
+    }
+    assert bot.edits[-1]["media"].media == "signed-file-id"
+    assert bot.edits[-1]["reply_markup"].inline_keyboard == []
+    assert "Условия:" in storage.archive[-1]["caption"]

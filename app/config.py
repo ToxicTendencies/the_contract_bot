@@ -1010,6 +1010,7 @@ def required_text_keys() -> Iterable[str]:
         "guest.render_failed",
         "guest.upload_failed",
         "guest.contract_expired",
+        "guest.continued",
         "guest.no_templates",
         "guest.help",
         "buttons.prev",
@@ -1026,6 +1027,7 @@ def required_text_keys() -> Iterable[str]:
         "callback.terms_first",
         "callback.cancelled",
         "callback.not_yours",
+        "callback.continued",
         "errors.generic",
         "errors.no_templates",
     )

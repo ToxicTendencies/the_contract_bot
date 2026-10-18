@@ -135,6 +135,14 @@ class ContractStore:
         token = self._by_inline.get(inline_message_id)
         return self._by_token.get(token) if token else None
 
+    def open_for_chat(self, chat_key: str) -> Contract | None:
+        """Незавершённый контракт чата: его продолжают новым сообщением."""
+        for token in reversed(self._chat_tokens.get(chat_key, [])):
+            contract = self._by_token.get(token)
+            if contract is not None and contract.state != STATE_SIGNED:
+                return contract
+        return None
+
     def for_message(self, chat_key: str, message_id: int | None) -> Contract | None:
         """Контракт чата, привязанный к конкретному сообщению бота."""
         if not message_id:
@@ -266,9 +274,18 @@ class ContractStore:
             self.drop(self._by_token[victim])
 
     def bind_inline(self, contract: Contract, inline_message_id: str) -> None:
+        if (
+            contract.inline_message_id
+            and contract.inline_message_id != inline_message_id
+        ):
+            self._by_inline.pop(contract.inline_message_id, None)
         contract.inline_message_id = inline_message_id
         self._by_inline[inline_message_id] = contract.token
         contract.touch()
+
+    def unbind_inline(self, inline_message_id: str | None) -> None:
+        if inline_message_id:
+            self._by_inline.pop(inline_message_id, None)
 
     def drop(self, contract: Contract) -> None:
         self._by_token.pop(contract.token, None)
@@ -284,6 +301,18 @@ class ContractStore:
         ):
             self._by_inline.pop(contract.inline_message_id, None)
         self.clear_pending(token=contract.token)
+
+    def drop_chat(self, chat_key: str, keep: str | None = None) -> list[Contract]:
+        """Забыть прежние контракты чата: живёт только последний."""
+        dropped: list[Contract] = []
+        for token in list(self._chat_tokens.get(chat_key, [])):
+            if keep is not None and token == keep:
+                continue
+            contract = self._by_token.get(token)
+            if contract is not None:
+                dropped.append(contract)
+                self.drop(contract)
+        return dropped
 
     def drop_token(self, token: str | None) -> None:
         contract = self.get(token)

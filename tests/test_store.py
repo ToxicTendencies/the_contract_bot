@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import time
 
-from app.store import ContractStore, STATE_PREVIEW, STATE_TERMS
+from app.store import ContractStore, STATE_PREVIEW, STATE_SIGNED, STATE_TERMS
 
 
 def make_store(**overrides) -> ContractStore:
@@ -171,3 +171,24 @@ def test_terms_pending_is_per_chat_and_user():
     assert contract.state == "open"
     assert contract.terms_user_id == 0
     assert store.terms_for_user(10, "g1") is None
+
+
+def test_drop_chat_keeps_only_the_last():
+    store = make_store()
+    first = store.create(chat_key="g1", template_key="classic", initiator_id=10)
+    second = store.create(chat_key="g1", template_key="free", initiator_id=10)
+    other = store.create(chat_key="g2", template_key="classic", initiator_id=20)
+
+    store.drop_chat("g1", keep=second.token)
+
+    assert store.get(first.token) is None
+    assert store.get(second.token) is second
+    assert store.get(other.token) is other
+    assert store.open_for_chat("g1") is second
+
+
+def test_open_for_chat_skips_signed():
+    store = make_store()
+    contract = store.create(chat_key="g1", template_key="classic", initiator_id=10)
+    contract.state = STATE_SIGNED
+    assert store.open_for_chat("g1") is None

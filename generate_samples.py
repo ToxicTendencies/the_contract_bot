@@ -231,10 +231,90 @@ def make_dark(path: Path, fonts: dict[str, Path], force: bool) -> bool:
     return True
 
 
+MEDIEVAL_BODY = (
+    "Сим документом стороны, поименованные ниже, заключают соглашение о добрых "
+    "делах, честном слове и своевременной плате.",
+    "Первая сторона обязуется исполнить работу в срок и без лукавства, вторая — "
+    "принять её и вознаградить по договорённости.",
+    "Кто слово не сдержит, тот ответит по совести. Споры решаются переговорами, "
+    "а не поединком — времена нынче спокойные.",
+    "Договор скрепляется подписями обеих сторон и вступает в силу с сего дня.",
+)
+
+
+def make_medieval(path: Path, fonts: dict[str, Path], force: bool) -> bool:
+    if path.exists() and not force:
+        return False
+    import random
+
+    width, height = 1240, 1754
+    parchment = "#e9d7b4"
+    ink = "#3b2415"
+    accent = "#6b4a2f"
+    seal = "#8b2f1d"
+
+    image = Image.new("RGB", (width, height), parchment)
+    draw = ImageDraw.Draw(image)
+
+    # Age spots: deterministic so repeated runs look identical.
+    rng = random.Random(42)
+    for _ in range(2600):
+        x = rng.randint(0, width - 1)
+        y = rng.randint(0, height - 1)
+        tone = rng.choice(("#dfcaa2", "#e3d0aa", "#d8c096"))
+        draw.point((x, y), fill=tone)
+
+    # Ornate border: thick outer, thin inner, corner squares.
+    draw.rectangle([46, 46, width - 46, height - 46], outline=ink, width=5)
+    draw.rectangle([64, 64, width - 64, height - 64], outline=ink, width=2)
+    for cx, cy in ((46, 46), (width - 46, 46), (46, height - 46), (width - 46, height - 46)):
+        draw.rectangle([cx - 12, cy - 12, cx + 12, cy + 12], fill=ink)
+
+    title_font = _font(fonts["serif_bold"], 82)
+    _centered(draw, "ДОГОВОРЪ", 132, title_font, ink, width)
+    _centered(
+        draw,
+        "о добрых делах и честном слове",
+        240,
+        _font(fonts["serif"], 32),
+        accent,
+        width,
+    )
+    draw.line([(380, 306), (860, 306)], fill=ink, width=2)
+
+    body_font = _font(fonts["serif"], 30)
+    y = 372
+    for paragraph in MEDIEVAL_BODY:
+        y = _paragraph(draw, paragraph, (112, y), width - 224, body_font, ink, 1.62) + 36
+
+    label_font = _font(fonts["serif"], 27)
+    hint_font = _font(fonts["serif"], 20)
+    for x, label in ((80, "Сторона 1"), (660, "Сторона 2")):
+        draw.text((x, 1214), label, font=label_font, fill=accent)
+        draw.line([(x, 1410), (x + 500, 1410)], fill=ink, width=2)
+        draw.text((x, 1422), "подпись", font=hint_font, fill=accent)
+        # Wax seal stamped on the end of the signature line.
+        draw.ellipse([x + 470, 1380, x + 530, 1440], fill=seal)
+        draw.ellipse([x + 480, 1390, x + 520, 1430], outline="#c9a227", width=2)
+
+    _centered(
+        draw,
+        "скреплено честным словом",
+        1600,
+        _font(fonts["serif"], 22),
+        accent,
+        width,
+    )
+
+    image.save(path)
+    return True
+
+
 BLANK_PAINTERS = {
     "classic": make_classic,
     "minimal": make_minimal,
     "dark": make_dark,
+    "medieval": make_medieval,
 }
 
 

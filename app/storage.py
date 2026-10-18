@@ -136,12 +136,18 @@ class TemplateStorage:
         self._save()
         return ready, len(templates)
 
-    async def upload_signed(self, bot: Bot, data: bytes, template_title: str) -> str:
-        """Upload a finished contract and return its file_id (also archives it)."""
+    async def upload_signed(self, bot: Bot, data: bytes, caption: str) -> str:
+        """Upload a finished contract and return its file_id (also archives it).
+
+        ``caption`` is HTML and already contains the signers' links.
+        """
+        if len(caption) > 1024:
+            caption = caption[:1020] + "…"
         message: Message = await bot.send_photo(
             chat_id=self.chat_id,
             photo=BufferedInputFile(data, filename="contract.jpg"),
-            caption=f"Подписано: {html.escape(template_title)}",
+            caption=caption,
+            parse_mode="HTML",
         )
         file_id = _photo_file_id(message)
         if not file_id:

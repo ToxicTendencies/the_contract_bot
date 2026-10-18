@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from types import SimpleNamespace
 
 
 @dataclass
@@ -10,6 +9,7 @@ class FakeUser:
     first_name: str = "Тест"
     last_name: str = ""
     username: str = "tester"
+    is_bot: bool = False
 
     @property
     def full_name(self) -> str:
@@ -51,13 +51,16 @@ class FakeCallback:
     user: FakeUser
     inline_message_id: str = "inline-1"
     answers: list[str] = field(default_factory=list)
+    urls: list[str] = field(default_factory=list)
 
     @property
     def from_user(self) -> FakeUser:
         return self.user
 
-    async def answer(self, text: str = "", **_: object) -> None:
+    async def answer(self, text: str = "", url: str | None = None, **_: object) -> None:
         self.answers.append(text)
+        if url:
+            self.urls.append(url)
 
 
 def make_callback(data: str, user_id: int = 1, inline_message_id: str = "inline-1") -> FakeCallback:

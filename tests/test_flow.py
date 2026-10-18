@@ -125,9 +125,10 @@ async def test_callback_sign_sets_pending(app, patched):
     contract = app.store.for_chat("g-100500")
     callback = FakeCallback(data=f"sg:{contract.token}:party1", user=FakeUser(7))
     await handle_callback(app, callback)
-    assert contract.pending is not None
-    assert contract.pending.field_key == "party1"
-    assert contract.pending.user_id == 7
+    pending = app.store.pending_for(7)
+    assert pending is not None
+    assert pending.field_key == "party1"
+    assert pending.token == contract.token
     assert patched["prompt"][0][0] == "party1"
 
 
@@ -217,7 +218,7 @@ async def test_cancel_by_initiator(app, patched):
     callback = FakeCallback(data=f"cx:{contract.token}", user=FakeUser(1))
     await handle_callback(app, callback)
     assert patched.get("restore")
-    assert contract.pending is None
+    assert app.store.pending_for(1) is None
 
 
 @pytest.mark.asyncio
@@ -243,7 +244,7 @@ async def test_signed_contract_rejects_callbacks(app, patched):
     contract.state = STATE_SIGNED
     callback = FakeCallback(data=f"sg:{contract.token}:party1", user=FakeUser(1))
     await handle_callback(app, callback)
-    assert callback.answers and "неактуален" in callback.answers[-1]
+    assert callback.answers[-1] == app.config.text("callback.done")
 
 
 @pytest.mark.asyncio

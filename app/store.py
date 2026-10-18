@@ -20,6 +20,9 @@ from dataclasses import dataclass, field
 STATE_PREVIEW = "preview"
 STATE_TERMS = "terms"
 STATE_OPEN = "open"
+# Все подписи на месте, но создатель ещё не подтвердил дату и не поставил
+# печать. Готовым контракт считается только после печати.
+STATE_SEAL = "seal"
 STATE_SIGNED = "signed"
 STATE_CLOSED = "closed"
 
@@ -106,6 +109,11 @@ class Contract:
     date_text: str | None = None
     date_auto: bool = True
     date_user_id: int = 0
+    # Создатель подтвердил дату после подписей — можно ставить печать.
+    date_confirmed: bool = False
+    # Печать: кто и когда поставил.
+    stamp_user_id: int = 0
+    stamped_at: float = 0.0
     initiator_id: int = 0
     initiator_name: str = ""
     state: str = STATE_PREVIEW
@@ -120,6 +128,10 @@ class Contract:
     @property
     def is_complete(self) -> bool:
         return self.state == STATE_SIGNED
+
+    @property
+    def is_stamped(self) -> bool:
+        return bool(self.stamped_at)
 
     @property
     def has_message(self) -> bool:
@@ -546,8 +558,27 @@ class ContractStore:
         contract.touch()
 
     def reset_signatures(self, contract: Contract) -> None:
-        """Условия изменились — старые подписи больше ничего не значат."""
+        """Условия изменились — старые подписи больше ничего не значат.
+
+        Печать тоже снимается: она скрепляла прежнюю редакцию, а дату
+        создателю придётся подтвердить заново.
+        """
         contract.signatures.clear()
+        contract.date_confirmed = False
+        contract.stamp_user_id = 0
+        contract.stamped_at = 0.0
+        if contract.state in {STATE_SEAL, STATE_SIGNED}:
+            contract.state = STATE_OPEN
+        self.clear_pending(token=contract.token)
+        self.clear_pending_terms(token=contract.token)
+        self.clear_pending_date(token=contract.token)
+        contract.touch()
+
+    def mark_stamped(self, contract: Contract, user_id: int) -> None:
+        """Печать поставлена: контракт готов, менять в нём нечего."""
+        contract.stamp_user_id = user_id
+        contract.stamped_at = time.time()
+        contract.state = STATE_SIGNED
         self.clear_pending(token=contract.token)
         self.clear_pending_terms(token=contract.token)
         self.clear_pending_date(token=contract.token)

@@ -6,6 +6,11 @@
 #
 # Шрифты можно указывать алиасом из блока fonts или путём к .ttf/.otf.
 # Шрифт подписи задаётся в defaults.font и может переопределяться в поле.
+#
+# stamp: круглая печать, которую ставит создатель контракта после подписей.
+#   center/radius — где и какого размера (по умолчанию правый нижний угол),
+#   color — цвет, text — надпись по дуге, subtext — строка в центре.
+#   stamp: {enabled: false} — бланк без печати.
 
 fonts:
   handwriting: assets/fonts/Caveat-Variable.ttf
@@ -66,6 +71,10 @@ templates:
       font_size: 32
       color: "#a33a2e"
       align: center
+    stamp:
+      color: "#244a78"
+      text: "СОГЛАСОВАНО"
+      subtext: "ДОГОВОР"
 
   minimal:
     file: templates/minimal.png
@@ -98,6 +107,10 @@ templates:
       font_size: 30
       color: "#b04a2f"
       align: center
+    stamp:
+      color: "#4a5568"
+      text: "СОГЛАСОВАНО"
+      subtext: "ДОГОВОР"
 
   dark:
     file: templates/dark.png
@@ -131,6 +144,10 @@ templates:
       font_size: 32
       color: "#d4a24c"
       align: center
+    stamp:
+      color: "#d9c48a"
+      text: "СОГЛАСОВАНО"
+      subtext: "ДОГОВОР"
 
   medieval:
     file: templates/medieval.png
@@ -164,6 +181,10 @@ templates:
       font_size: 30
       color: "#8b2f1d"
       align: center
+    stamp:
+      color: "#8b2f1d"
+      text: "СКРЕПЛЕНО"
+      subtext: "ДОГОВОР"
 
   free:
     file: templates/free.png
@@ -211,3 +232,7 @@ templates:
       font_size: 32
       color: "#a33a2e"
       align: center
+    stamp:
+      color: "#244a78"
+      text: "СОГЛАСОВАНО"
+      subtext: "ДОГОВОР"

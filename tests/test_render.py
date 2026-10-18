@@ -5,12 +5,13 @@ from pathlib import Path
 
 from PIL import Image, ImageChops
 
-from app.config import Box, load_templates
+from app.config import Box, default_stamp, load_templates
 from app.render import (
     build_canvas,
     count_graphemes,
     debug_image,
     default_date,
+    draw_stamp,
     format_date,
     layout_text,
     normalize_text,
@@ -265,3 +266,54 @@ def test_debug_image_works_for_custom_template(tmp_path):
     template = _custom_template(tmp_path)
     image = debug_image(template, draw_samples=False)
     assert image.size == (1000, 1400)
+
+
+# ---------------------------------------------------------------------------
+# печать
+# ---------------------------------------------------------------------------
+
+
+def test_stamped_contract_differs_from_plain_one():
+    template = load_templates(strict=True).get("classic")
+    stamp = template.stamp_rule
+    assert stamp is not None
+    signatures = {"party1": "Иванов И.И.", "party2": "Петров П.П."}
+    plain = Image.open(io.BytesIO(render_contract(template, signatures, date="18.10.2026")))
+    sealed = Image.open(
+        io.BytesIO(render_contract(template, signatures, date="18.10.2026", stamped=True))
+    )
+    # Разница есть, и именно там, где стоит печать.
+    diff = ImageChops.difference(plain.convert("RGB"), sealed.convert("RGB"))
+    left, top, right, bottom = diff.getbbox()
+    cx, cy = stamp.center
+    assert left <= cx + stamp.radius and right >= cx - stamp.radius
+    assert top <= cy + stamp.radius and bottom >= cy - stamp.radius
+
+
+def test_stamp_draws_ring_and_text():
+    canvas = Image.new("RGB", (600, 600), "white")
+    stamp = default_stamp(600, 600)
+    draw_stamp(canvas, stamp, date_text="18.10.2026")
+    # Кольцо нарисовано: на радиусе пиксель не белый, внутри — белый.
+    cx, cy = stamp.center
+    ring = canvas.getpixel((cx + stamp.radius, cy))
+    middle = canvas.getpixel((cx, cy))
+    assert ring != (255, 255, 255)
+    assert middle == (255, 255, 255), "середина печати не закрашена"
+
+
+def test_stamp_is_not_drawn_without_flag():
+    template = load_templates(strict=True).get("classic")
+    data = render_contract(template, {}, date="18.10.2026")
+    image = Image.open(io.BytesIO(data))
+    assert image.size == template.canvas
+
+
+def test_disabled_stamp_is_not_drawn():
+    template = load_templates(strict=True).get("classic")
+    import dataclasses
+
+    disabled = dataclasses.replace(template, stamp=None, stamp_off=True)
+    data = render_contract(disabled, {}, date="18.10.2026", stamped=True)
+    image = Image.open(io.BytesIO(data))
+    assert image.size == template.canvas

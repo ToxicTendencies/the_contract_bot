@@ -3,11 +3,12 @@ from __future__ import annotations
 import time
 
 from app.store import (
-    ContractStore,
     STATE_OPEN,
     STATE_PREVIEW,
+    STATE_SEAL,
     STATE_SIGNED,
     STATE_TERMS,
+    ContractStore,
 )
 
 
@@ -318,3 +319,51 @@ def test_pending_date_expires_and_is_dropped_with_contract():
     store.set_pending_date(20, second)
     store.drop(second)
     assert store.pending_date_for(20) is None
+
+
+# ---------------------------------------------------------------------------
+# финальный шаг: дата и печать
+# ---------------------------------------------------------------------------
+
+
+def test_mark_stamped_completes_contract():
+    store = make_store()
+    contract = store.create(chat_key="g1", template_key="classic", initiator_id=10)
+    contract.state = STATE_SEAL
+    store.set_pending(20, contract, "party2")
+
+    store.mark_stamped(contract, 10)
+
+    assert contract.state == STATE_SIGNED
+    assert contract.is_stamped
+    assert contract.stamp_user_id == 10
+    assert contract.stamped_at > 0
+    assert store.pending_for(20, "g1") is None
+
+
+def test_reset_signatures_removes_stamp():
+    """Оспаривание снимает и печать: скреплять заново."""
+    store = make_store()
+    contract = store.create(chat_key="g1", template_key="free", initiator_id=10)
+    store.set_terms(contract, "условия", author_id=10)
+    store.add_signature(contract, field_key="party1", text="Аня", user_id=10)
+    contract.state = STATE_SEAL
+    store.mark_stamped(contract, 10)
+    contract.state = STATE_SEAL  # как будто оспорили до финала
+
+    store.reset_signatures(contract)
+
+    assert not contract.is_stamped
+    assert contract.stamp_user_id == 0
+    assert contract.date_confirmed is False
+    assert contract.state == STATE_OPEN
+
+
+def test_seal_contract_still_counts_as_open_for_chat():
+    """Незавершённый контракт в финальном шаге не забывается новым @бот."""
+    store = make_store()
+    contract = store.create(chat_key="g1", template_key="classic", initiator_id=10)
+    contract.state = STATE_SEAL
+    assert store.open_for_chat("g1") is contract
+    contract.state = STATE_SIGNED
+    assert store.open_for_chat("g1") is None

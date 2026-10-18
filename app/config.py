@@ -30,6 +30,14 @@ log = logging.getLogger(__name__)
 BASE_DIR = Path(__file__).resolve().parent.parent
 CONFIG_DIR = BASE_DIR / "config"
 DEFAULT_FONT = BASE_DIR / "assets" / "fonts" / "Neucha.ttf"
+# Печать рисуется строгим шрифтом с засечками: рукописный тут не читается.
+DEFAULT_STAMP_FONT = BASE_DIR / "assets" / "fonts" / "PTSerif-Bold.ttf"
+
+# Как выглядит круглая печать по умолчанию. Всё это можно переопределить
+# блоком stamp: в templates.yaml или в своём файле бланков.
+STAMP_DEFAULT_TEXT = "СОГЛАСОВАНО"
+STAMP_DEFAULT_SUBTEXT = "ДОГОВОР"
+STAMP_DEFAULT_COLOR = "#244a78"
 
 
 class ConfigError(RuntimeError):
@@ -409,6 +417,28 @@ class FrameConfig:
 
 
 @dataclass(frozen=True)
+class StampConfig:
+    """Круглая печать: две окружности, надпись по дуге и дата внутри."""
+
+    center: tuple[int, int]
+    radius: int
+    color: str = STAMP_DEFAULT_COLOR
+    text: str = STAMP_DEFAULT_TEXT
+    subtext: str = STAMP_DEFAULT_SUBTEXT
+    line_width: int = 4
+    alpha: float = 0.9
+    font: Path = DEFAULT_STAMP_FONT
+
+
+def default_stamp(width: int, height: int) -> StampConfig:
+    """Печать по умолчанию: правый нижний угол, свободный на всех бланках."""
+    return StampConfig(
+        center=(int(width * 0.87), int(height * 0.90)),
+        radius=max(40, int(min(width, height) * 0.075)),
+    )
+
+
+@dataclass(frozen=True)
 class NoteConfig:
     box: Box
     style: TextStyle
@@ -439,6 +469,19 @@ class TemplateConfig:
     background: BackgroundConfig | None = None
     frame: FrameConfig | None = None
     canvas: tuple[int, int] = (1240, 1754)
+    # Печать ставят в конце; пусто — стандартная по размеру холста.
+    stamp: StampConfig | None = None
+    # stamp: {enabled: false} — у бланка печати нет вовсе.
+    stamp_off: bool = False
+
+    @property
+    def stamp_rule(self) -> StampConfig | None:
+        """Печать бланка; None — бланк без печати."""
+        if self.stamp_off:
+            return None
+        if self.stamp is not None:
+            return self.stamp
+        return default_stamp(*self.canvas)
 
     @property
     def date_blocks(self) -> tuple[DateConfig, ...]:
@@ -751,6 +794,72 @@ def _parse_frame(value: Any, name: str, *, strict: bool) -> FrameConfig | None:
     )
 
 
+def _parse_stamp(
+    value: Any,
+    name: str,
+    *,
+    width: int,
+    height: int,
+    fonts: dict[str, Path],
+    strict: bool,
+    warnings: list[str] | None = None,
+) -> StampConfig | None:
+    """Блок stamp: где и как ставить печать. ``enabled: false`` — без печати."""
+    if value is None:
+        return default_stamp(width, height)
+    if not isinstance(value, dict):
+        raise ConfigError(f"{name}: ожидался словарь")
+    if value.get("enabled", True) is False:
+        return None
+
+    base = default_stamp(width, height)
+    radius = _as_int(value.get("radius", base.radius), f"{name}.radius", minimum=20)
+    radius = min(radius, min(width, height) // 3)
+
+    center_raw = value.get("center")
+    if center_raw is None:
+        cx, cy = base.center
+    else:
+        if not isinstance(center_raw, (list, tuple)) or len(center_raw) != 2:
+            raise ConfigError(f"{name}.center: нужен [x, y]")
+        try:
+            cx, cy = int(center_raw[0]), int(center_raw[1])
+        except (TypeError, ValueError) as exc:
+            raise ConfigError(f"{name}.center: нужен [x, y]") from exc
+
+    if cx - radius < 0 or cy - radius < 0 or cx + radius > width or cy + radius > height:
+        message = (
+            f"{name}: печать выходит за бланк {width}x{height} "
+            f"(центр {cx},{cy}, радиус {radius})"
+        )
+        if strict:
+            raise ConfigError(message)
+        if warnings is not None:
+            warnings.append(message)
+        log.warning("%s", message)
+        cx = min(max(cx, radius), width - radius)
+        cy = min(max(cy, radius), height - radius)
+
+    color = str(value.get("color", base.color))
+    try:
+        ImageColor.getrgb(color)
+    except ValueError as exc:
+        raise ConfigError(f"{name}.color: неизвестный цвет {color!r}") from exc
+
+    font = _resolve_font(value.get("font", "serif_bold"), fonts, f"{name}.font", strict)
+
+    return StampConfig(
+        center=(cx, cy),
+        radius=radius,
+        color=color,
+        text=str(value.get("text", base.text)),
+        subtext=str(value.get("subtext", base.subtext)),
+        line_width=_as_int(value.get("line_width", 4), f"{name}.line_width", minimum=1),
+        alpha=_as_float(value.get("alpha", 0.9), f"{name}.alpha", minimum=0.2, maximum=1.0),
+        font=font,
+    )
+
+
 def _parse_dates(
     raw: Any,
     defaults: dict[str, Any],
@@ -1057,6 +1166,22 @@ def _load_templates_file(
             log.error("%s", message)
             continue
 
+        stamp_raw = template_raw.get("stamp")
+        stamp_off = isinstance(stamp_raw, dict) and stamp_raw.get("enabled", True) is False
+        stamp = (
+            None
+            if stamp_off
+            else _parse_stamp(
+                stamp_raw,
+                f"templates.{key}.stamp",
+                width=width,
+                height=height,
+                fonts=fonts,
+                strict=strict,
+                warnings=warnings,
+            )
+        )
+
         dates = _parse_dates(
             template_raw.get("dates"),
             defaults,
@@ -1132,6 +1257,8 @@ def _load_templates_file(
                 background=background,
                 frame=frame,
                 canvas=canvas if file_path is None else (width, height),
+                stamp=stamp,
+                stamp_off=stamp_off,
             )
         )
 
@@ -1367,9 +1494,17 @@ def required_text_keys() -> Iterable[str]:
         "guest.one_signed",
         "guest.done_caption",
         "guest.done_self_caption",
+        "guest.done_date_line",
         "guest.self_sign_note",
         "guest.sign_saved",
         "guest.sign_complete",
+        "guest.stamp_complete",
+        "guest.seal_caption",
+        "guest.seal_caption_no_date",
+        "guest.seal_caption_anonymous",
+        "guest.seal_caption_anonymous_no_date",
+        "guest.seal_ready",
+        "guest.seal_ready_no_date",
         "guest.too_long",
         "guest.empty",
         "guest.does_not_fit",
@@ -1393,7 +1528,9 @@ def required_text_keys() -> Iterable[str]:
         "buttons.signed",
         "buttons.dispute",
         "buttons.propose_terms",
-        "buttons.date",
+        "buttons.confirm_date",
+        "buttons.change_date",
+        "buttons.stamp",
         "buttons.cancel",
         "callback.expired",
         "callback.done",
@@ -1406,6 +1543,11 @@ def required_text_keys() -> Iterable[str]:
         "callback.terms_changing",
         "callback.cancelled",
         "callback.not_yours",
+        "callback.not_creator",
+        "callback.all_signed",
+        "callback.stamped",
+        "callback.date_first",
+        "callback.date_later",
         "errors.generic",
         "errors.no_templates",
     )

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import logging
+import math
 from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime
@@ -11,7 +12,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import regex
-from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps
+from PIL import Image, ImageColor, ImageDraw, ImageFilter, ImageFont, ImageOps
 
 from .config import (
     DEFAULT_FONT,
@@ -23,6 +24,7 @@ from .config import (
     FrameConfig,
     Limits,
     RenderSettings,
+    StampConfig,
     TemplateConfig,
     TermsConfig,
     TextStyle,
@@ -604,6 +606,123 @@ def _encode(image: Image.Image, settings: RenderSettings) -> bytes:
     return buffer.getvalue()
 
 
+def _draw_arc_text(
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    font: ImageFont.FreeTypeFont,
+    fill: tuple[int, ...],
+    center: tuple[int, int],
+    radius: float,
+    *,
+    overlay: Image.Image,
+    max_span: float = math.pi * 0.9,
+) -> None:
+    """Надпись по верхней дуге печати: каждая буква повёрнута по радиусу."""
+    widths = [draw.textlength(char, font=font) for char in text]
+    total = sum(widths)
+    if total <= 0 or radius <= 0:
+        return
+    # Угол на пиксель: чем больше радиус, тем положе дуга.
+    span = min(max_span, total / radius)
+    step = span / total
+    angle = -span / 2
+    tile_side = int(font.size * 1.9) + 8
+    for char, width in zip(text, widths):
+        middle = angle + width * step / 2
+        x = center[0] + radius * math.sin(middle)
+        y = center[1] - radius * math.cos(middle)
+        tile_size = max(tile_side, int(width) + 8)
+        tile = Image.new("RGBA", (tile_size, tile_size), (0, 0, 0, 0))
+        ImageDraw.Draw(tile).text(
+            (tile.width / 2, tile.height / 2),
+            char,
+            font=font,
+            fill=fill,
+            anchor="mm",
+        )
+        tile = tile.rotate(-math.degrees(middle), resample=Image.BICUBIC, expand=False)
+        overlay.paste(
+            tile,
+            (int(x - tile.width / 2), int(y - tile.height / 2)),
+            tile,
+        )
+        angle += width * step
+
+
+def draw_stamp(
+    image: Image.Image,
+    stamp: StampConfig,
+    *,
+    date_text: str = "",
+) -> None:
+    """Нарисовать круглую печать поверх бланка.
+
+    Печать полупрозрачная: подписи под ней должны читаться. Всё рисуется на
+    отдельном слое, поэтому цвет и прозрачность не зависят от бланка.
+    """
+    radius = stamp.radius
+    if radius < 8:
+        return
+    red, green, blue = ImageColor.getrgb(stamp.color)
+    color = (red, green, blue, int(255 * stamp.alpha))
+    overlay = Image.new("RGBA", image.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+    cx, cy = stamp.center
+
+    draw.ellipse(
+        [cx - radius, cy - radius, cx + radius, cy + radius],
+        outline=color,
+        width=stamp.line_width,
+    )
+    inner = int(radius * 0.84)
+    draw.ellipse(
+        [cx - inner, cy - inner, cx + inner, cy + inner],
+        outline=color,
+        width=max(1, stamp.line_width - 1),
+    )
+
+    if stamp.text:
+        arc_font = _load_font(stamp.font, max(10, int(radius * 0.22)))
+        _draw_arc_text(
+            draw,
+            stamp.text,
+            arc_font,
+            color,
+            (cx, cy),
+            radius * 0.64,
+            overlay=overlay,
+        )
+
+    if stamp.subtext:
+        sub_font = _load_font(stamp.font, max(10, int(radius * 0.24)))
+        draw.text(
+            (cx, cy - radius * 0.10),
+            stamp.subtext,
+            font=sub_font,
+            fill=color,
+            anchor="mm",
+        )
+
+    line_y = cy + radius * 0.16
+    draw.line(
+        [(cx - inner * 0.55, line_y), (cx + inner * 0.55, line_y)],
+        fill=color,
+        width=max(1, stamp.line_width - 2),
+    )
+
+    if date_text:
+        date_font = _load_font(stamp.font, max(9, int(radius * 0.18)))
+        draw.text(
+            (cx, cy + radius * 0.42),
+            date_text,
+            font=date_font,
+            fill=color,
+            anchor="mm",
+        )
+
+    image.paste(overlay, (0, 0), overlay)
+
+
 def render_contract(
     template: TemplateConfig,
     signatures: dict[str, str],
@@ -612,8 +731,13 @@ def render_contract(
     terms: str | None = None,
     date: str | None = None,
     settings: RenderSettings | None = None,
+    stamped: bool = False,
 ) -> bytes:
-    """Draw terms, date, signatures and the optional note; return a JPEG."""
+    """Draw terms, date, signatures and the optional note; return a JPEG.
+
+    ``stamped=True`` добавляет печать: её ставит создатель контракта уже
+    после всех подписей и подтверждения даты.
+    """
     settings = settings or RenderSettings()
     image = build_canvas(template)
     draw = ImageDraw.Draw(image)
@@ -635,6 +759,12 @@ def render_contract(
             dates.style.align,
             dates.style.valign,
         )
+
+    stamp = template.stamp_rule
+    if stamped and stamp is not None:
+        # Печать рисуем до подписей: если она случайно накроет подпись,
+        # та останется читаемой, а не утонет под краской.
+        draw_stamp(image, stamp, date_text=date or "")
 
     if terms and template.terms is not None:
         layout = layout_text(

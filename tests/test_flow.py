@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 
 from app.handlers import handle_callback, handle_chat_message, split_mention
-from app.store import STATE_SIGNED
+from app.store import STATE_SEAL, STATE_SIGNED
 
 from .helpers import FakeCallback, FakeChat, FakeMessage, FakeUser
 
@@ -11,7 +11,16 @@ from .helpers import FakeCallback, FakeChat, FakeMessage, FakeUser
 @pytest.fixture()
 def patched(app, monkeypatch):
     """Replace Telegram side effects with recorders."""
-    calls = {"text": [], "preview": [], "contract": [], "prompt": [], "progress": [], "final": []}
+    calls = {
+        "text": [],
+        "preview": [],
+        "contract": [],
+        "prompt": [],
+        "progress": [],
+        "final": [],
+        "seal": [],
+        "stamp": [],
+    }
 
     async def post_text(message, text):
         calls["text"].append(text)
@@ -37,8 +46,14 @@ def patched(app, monkeypatch):
         calls["progress"].append(field_key)
         return True
 
-    async def finalize(contract, template):
+    async def finalize(contract, template, *, stamp=False, user_id=0):
         calls["final"].append(dict(contract.signatures))
+        calls["stamp"].append(stamp)
+        return True
+
+    async def show_seal_card(contract, template):
+        calls["seal"].append(dict(contract.signatures))
+        contract.state = STATE_SEAL
         return True
 
     async def restore(contract, template):
@@ -54,6 +69,7 @@ def patched(app, monkeypatch):
     monkeypatch.setattr(app, "show_prompt", show_prompt)
     monkeypatch.setattr(app, "show_signed_progress", show_signed_progress)
     monkeypatch.setattr(app, "finalize", finalize)
+    monkeypatch.setattr(app, "show_seal_card", show_seal_card)
     monkeypatch.setattr(app, "restore_contract_view", restore)
     monkeypatch.setattr(app, "mark_expired", mark_expired)
     monkeypatch.setattr(app.storage, "is_ready", lambda key: True)
@@ -191,7 +207,10 @@ async def test_two_users_finish_contract(app, patched):
         )
 
     assert len(contract.signatures) == 2
-    assert patched["final"] and len(patched["final"][0]) == 2
+    # Готовым контракт станет после подтверждения даты и печати.
+    assert patched["seal"] and len(patched["seal"][0]) == 2
+    assert not patched["final"], "без печати финала нет"
+    assert contract.state == STATE_SEAL
     assert not contract.same_signers()
 
 
@@ -208,7 +227,8 @@ async def test_same_user_signs_both(app, patched):
             FakeMessage(text=VALID, user=FakeUser(5), guest_query_id=f"q-{field_key}"),
         )
     assert contract.same_signers()
-    assert patched["final"]
+    assert patched["seal"], "после последней подписи ждём дату и печать"
+    assert contract.state == STATE_SEAL
 
 
 @pytest.mark.asyncio

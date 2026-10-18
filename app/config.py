@@ -975,6 +975,8 @@ def required_text_keys() -> Iterable[str]:
         "dm.reloaded",
         "dm.reload_failed",
         "dm.status",
+        "dm.debug",
+        "dm.debug_empty",
         "dm.unknown_dm",
         "dm.nothing_pending",
         "archive.caption",
@@ -1027,7 +1029,6 @@ def required_text_keys() -> Iterable[str]:
         "callback.terms_first",
         "callback.cancelled",
         "callback.not_yours",
-        "callback.continued",
         "errors.generic",
         "errors.no_templates",
     )

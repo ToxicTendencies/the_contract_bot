@@ -57,17 +57,52 @@ def split_mention(text: str, username: str) -> tuple[str, bool]:
     return pattern.sub(" ", text).strip(), found
 
 
+PRIVATE_KEY = "p"
+
+
+def _is_private(message: Message) -> bool:
+    chat = message.chat
+    if getattr(chat, "type", "") == "private":
+        return True
+    # guest-сообщение без типа чата, но с положительным id — это личка
+    return bool(message.guest_query_id) and chat.id > 0
+
+
 def _chat_key(message: Message) -> str:
-    return chat_key(message.chat.id, message.message_thread_id)
+    """Ключ чата: контракт живёт в чате, темы форума не дробят его.
+
+    В личке между двумя людьми Telegram показывает guest-боту **разный**
+    ``chat.id`` в зависимости от того, кто пишет: это id собеседника. Если
+    брать его как есть, у каждого участника получается свой чат и свой
+    контракт — второй человек не может подписать чужой бланк. Поэтому для
+    лички ключ — неупорядоченная пара (пишущий, собеседник): она одинакова
+    с обеих сторон.
+    """
+    if _is_private(message):
+        mine = getattr(message.from_user, "id", 0) or 0
+        low, high = sorted((mine, message.chat.id))
+        return f"{PRIVATE_KEY}{low}:{high}"
+    return chat_key(message.chat.id)
+
+
+def _reply_is_bot(app: "App", reply: object | None) -> bool:
+    """Ответ на сообщение бота — обычное или guest-сообщение.
+
+    Guest-ответ Telegram может отдать «от имени» вызвавшего, поэтому смотрим
+    ещё и на ``guest_bot_caller_*``: эти поля есть только у сообщений бота.
+    """
+    if reply is None:
+        return False
+    author = getattr(reply, "from_user", None)
+    if author is not None and getattr(author, "id", None) == app.bot_id:
+        return True
+    return getattr(reply, "guest_bot_caller_user", None) is not None
 
 
 def _reply_contract(app: "App", message: Message, key: str) -> Contract | None:
     """Контракт, на сообщение которого ответили (в режиме участника)."""
     reply = message.reply_to_message
-    if reply is None:
-        return None
-    author = getattr(reply, "from_user", None)
-    if author is None or getattr(author, "id", None) != app.bot_id:
+    if not _reply_is_bot(app, reply):
         return None
     return app.store.for_message(key, getattr(reply, "message_id", None))
 
@@ -245,6 +280,7 @@ async def handle_pending_text(
     text: str,
     say: Say,
     pending: PendingSignature | None = None,
+    ignore_chat: bool = False,
 ) -> None:
     key = _chat_key(message)
     pending = pending if pending is not None else app.store.pending_for(user.id, key)
@@ -255,9 +291,13 @@ async def handle_pending_text(
         app.store.clear_pending(user.id, pending.token)
         await say(app.config.text("guest.contract_expired", bot=app.bot_username))
         return
-    if contract.chat_key is not None and contract.chat_key != key:
+    if contract.chat_key is not None and contract.chat_key != key and not ignore_chat:
         # Ответ пришёл в другой чат: чужой контракт не подписываем,
         # но ожидание сохраняем — человек ещё может ответить там, где нажал.
+        app.note(
+            f"sign rejected: chat {key} != contract {contract.chat_key} "
+            f"user={user.id} token={contract.token}"
+        )
         return
     if contract.state == STATE_SIGNED:
         app.store.clear_pending(user.id, pending.token)
@@ -311,10 +351,15 @@ async def handle_chat_message(app: "App", message: Message) -> None:
 
     reply = message.reply_to_message
     reply_author = reply.from_user if reply is not None else None
-    is_reply_to_bot = bool(reply_author is not None and reply_author.id == app.bot_id)
+    is_reply_to_bot = _reply_is_bot(app, reply)
     # В guest-режиме бот получает только упоминания и ответы на свои сообщения,
     # в чате-участнике — всё подряд, поэтому там принимаем текст только ответом.
     accept_input = bool(message.guest_query_id) or is_reply_to_bot
+
+    app.note(
+        f"msg key={key} user={user.id} guest={bool(message.guest_query_id)} "
+        f"mention={had_mention} reply_bot={is_reply_to_bot} text={text[:24]!r}"
+    )
 
     async def say(reply_text: str) -> None:
         await app.post_text(message, reply_text)
@@ -336,8 +381,18 @@ async def handle_chat_message(app: "App", message: Message) -> None:
                 and target.terms_user_id == user.id
             ):
                 terms_contract = target
+        loose = False
         if pending is None and terms_contract is None:
             pending = app.store.pending_for(user.id, key)
+        if pending is None and terms_contract is None and _is_private(message):
+            # В личке id чата может «переехать» при смене говорящего.
+            # Если у человека ровно одно ожидание в личке — это точно оно.
+            candidate = app.store.unique_pending(user.id)
+            if candidate is not None:
+                owner = app.store.get(candidate.token)
+                if owner is not None and (owner.chat_key or "").startswith(PRIVATE_KEY):
+                    pending = candidate
+                    loose = True
         if pending is None and terms_contract is None:
             terms_contract = app.store.terms_for_user(user.id, key)
 
@@ -347,7 +402,13 @@ async def handle_chat_message(app: "App", message: Message) -> None:
             if not text:
                 await say(app.config.text("guest.text_only"))
                 return
-            await handle_pending_text(app, message, user, text, say, pending=pending)
+            app.note(
+                f"sign input user={user.id} token={pending.token} "
+                f"field={pending.field_key} loose={loose}"
+            )
+            await handle_pending_text(
+                app, message, user, text, say, pending=pending, ignore_chat=loose
+            )
             return
 
         if terms_contract is not None:
@@ -485,6 +546,10 @@ async def handle_callback(app: "App", query: CallbackQuery) -> None:
         user.id,
         (query.inline_message_id or "-")[:14],
     )
+    app.note(
+        f"cb {action} token={token or '-'} user={user.id} "
+        f"inline={(query.inline_message_id or '-')[:20]}"
+    )
 
     if action in {"pv", "pn", "pk"}:
         await _handle_preview(app, query, token, argument, pick=(action == "pk"))
@@ -505,9 +570,9 @@ async def handle_callback(app: "App", query: CallbackQuery) -> None:
         return
 
     if action == "no":
-        contract = app.store.get(token)
-        if contract is None or not _is_current_card(contract, query):
-            await query.answer(_stale_notice(app, query, token))
+        contract = _live_contract(app, query, token)
+        if contract is None:
+            await query.answer(_callback_expired(app))
             return
         if contract.state == STATE_SIGNED:
             await query.answer(app.config.text("callback.done"))
@@ -544,53 +609,56 @@ def _split_side(argument: str) -> tuple[str, str]:
     return "", head
 
 
-def _is_current_card(contract: Contract, query: CallbackQuery) -> bool:
-    """Кнопка нажата на актуальном сообщении контракта, а не на старом."""
-    if query.inline_message_id:
-        return contract.inline_message_id == query.inline_message_id
+def _adopt_card(app: "App", contract: Contract, query: CallbackQuery) -> None:
+    """Сделать карточку, на которой нажали, той, которую бот редактирует.
+
+    В кнопке лежит токен контракта, а не адрес сообщения, и один и тот же
+    контракт может быть показан в чате несколько раз (повторный ``@бот``
+    переносит его вниз). Нажатие на любую такую карточку относится к живому
+    контракту — переключаемся на неё, иначе второй участник, нажав на старую
+    карточку, не получает ничего.
+    """
+    inline_id = query.inline_message_id
+    if inline_id:
+        if contract.inline_message_id != inline_id:
+            app.store.bind_inline(contract, inline_id)
+        return
     message = getattr(query, "message", None)
+    chat = getattr(message, "chat", None)
     message_id = getattr(message, "message_id", None)
-    if message_id is not None and contract.message_id is not None:
-        return message_id == contract.message_id
-    return True
+    if chat is not None and message_id is not None:
+        key = chat_key(chat.id)
+        if contract.message_id != message_id or contract.inline_message_id:
+            app.store.bind_message(
+                contract, chat_id=chat.id, message_id=message_id, chat_key=key
+            )
 
 
-def _stale_notice(app: "App", query: CallbackQuery, token: str) -> str:
-    """Что ответить на кнопку: контракт жив, но карточка уже старая."""
-    contract = app.store.get(token)
-    if contract is not None and not _is_current_card(contract, query):
-        return app.config.text("callback.continued")
-    return _callback_expired(app)
-
-
-def _resolve_contract(
+def _live_contract(
     app: "App", query: CallbackQuery, token: str
 ) -> Contract | None:
-    """Контракт за кнопкой.
+    """Контракт за кнопкой; карточка нажатия становится актуальной.
 
     Состояние живёт только в RAM, поэтому заново контракт не собирается:
     после перезапуска старые кнопки честно отвечают «неактуально», а не
-    начинают подпись с пустого бланка. Кнопки старой карточки, которую
-    перенесли новым сообщением, отвечают «продолжение ниже».
+    начинают подпись с пустого бланка. Забытые контракты (их вытеснил
+    следующий ``@бот``) тоже отвечают «неактуально».
     """
     contract = app.store.get(token)
     if contract is None:
+        app.note(f"cb token={token} unknown (forgotten or restart)")
         return None
-    if not _is_current_card(contract, query):
-        return None
+    _adopt_card(app, contract, query)
     return contract
 
 
 async def _handle_preview(
     app: "App", query: CallbackQuery, token: str, argument: str, *, pick: bool
 ) -> None:
-    contract = app.store.get(token)
+    contract = _live_contract(app, query, token)
     if contract is None:
         # Превью не восстановить: в callback_data только токен.
         await query.answer(_callback_expired(app))
-        return
-    if not _is_current_card(contract, query):
-        await query.answer(app.config.text("callback.continued"))
         return
     if contract.state == STATE_SIGNED:
         await query.answer(app.config.text("callback.done"))
@@ -638,9 +706,9 @@ async def _handle_sign_press(
     template_key: str,
     field_key: str,
 ) -> None:
-    contract = _resolve_contract(app, query, token)
+    contract = _live_contract(app, query, token)
     if contract is None:
-        await query.answer(_stale_notice(app, query, token))
+        await query.answer(_callback_expired(app))
         return
 
     template = _template_for(app, contract, template_key)
@@ -675,9 +743,9 @@ async def _handle_sign_press(
 
 
 async def _handle_cancel(app: "App", query: CallbackQuery, token: str) -> None:
-    contract = app.store.get(token)
-    if contract is None or not _is_current_card(contract, query):
-        await query.answer(_stale_notice(app, query, token))
+    contract = _live_contract(app, query, token)
+    if contract is None:
+        await query.answer(_callback_expired(app))
         return
 
     holders = {pending.user_id for pending in app.store.pending_for_contract(contract.token)}
@@ -738,7 +806,7 @@ async def _dm_greeting(app: "App", message: Message, user: User, command: str) -
 async def _dm_owner_command(
     app: "App", message: Message, user: User, command: str
 ) -> None:
-    if command not in {"/templates", "/status", "/reload"}:
+    if command not in {"/templates", "/status", "/reload", "/debug"}:
         await message.answer(app.config.text("dm.unknown_dm", bot=app.bot_username))
         return
     if user.id != app.settings.owner_id:
@@ -762,6 +830,21 @@ async def _dm_owner_command(
             return
         ready, total = await app.ensure_templates_ready()
         await message.answer(app.config.text("dm.reloaded", count=ready, total=total))
+        return
+
+    if command == "/debug":
+        empty = app.config.text("dm.debug_empty")
+        contracts = "\n".join(app.contracts_report()) or empty
+        events = "\n".join(html.escape(line) for line in app.recent_events(25)) or empty
+        await message.answer(
+            app.config.text(
+                "dm.debug",
+                active=app.store.active_count,
+                pending=app.store.pending_count,
+                contracts=contracts,
+                events=events,
+            )
+        )
         return
 
     await message.answer(

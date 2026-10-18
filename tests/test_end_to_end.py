@@ -79,6 +79,7 @@ class FakeGuestMessage:
         *,
         query_id: str = "q1",
         reply_to: object | None = None,
+        thread_id: int | None = None,
     ) -> None:
         self.text = text
         self.from_user = user
@@ -87,7 +88,7 @@ class FakeGuestMessage:
         self.guest_query_id = query_id
         self.guest_bot_caller_user = user
         self.guest_bot_caller_chat = self.chat
-        self.message_thread_id = None
+        self.message_thread_id = thread_id
         self.reply_to_message = reply_to
         self.answers: list[object] = []
 
@@ -302,12 +303,20 @@ async def test_new_mention_continues_contract(wired):
     assert retired["reply_markup"].inline_keyboard == []
     assert "продолжен" in retired["caption"]
 
-    # кнопка на старой карточке не начинает подпись заново
-    stale = await press(
+    # если клиент всё-таки нажал кнопку на старой карточке (гашение могло
+    # не дойти), это тот же живой контракт: подпись начинается, карточка
+    # снова становится редактируемой
+    late = await press(
         app, f"sg:{contract.token}:classic:party2", FakeUser(66), first_inline
     )
-    assert "продолжен" in stale.answers[-1], stale.answers
-    assert app.store.pending_for(66) is None
+    assert late.answers[-1] == ""
+    assert app.store.pending_for(66).token == contract.token
+    assert contract.inline_message_id == first_inline
+    await handle_chat_message(
+        app, reply_to_bot("Поздний Б.", FakeUser(66), contract, chat=chat)
+    )
+    assert contract.state == STATE_SIGNED
+    assert contract.signatures["party2"].user_id == 66
 
 
 @pytest.mark.asyncio
@@ -803,6 +812,111 @@ async def test_unknown_template_keeps_live_contract(wired):
     )
     assert app.store.get(contract.token) is contract
     assert app.store.open_for_chat("g-100500") is contract
+
+
+@pytest.mark.asyncio
+async def test_private_chat_both_people_share_one_contract(wired):
+    """Личка двух людей: Telegram отдаёт каждому свой chat_id — чат один.
+
+    Guest-боту в личке между Аней и Борисом приходит id собеседника: Ане —
+    Борис, Борису — Аня. Ключ контракта строится на паре, поэтому оба
+    работают с одним и тем же бланком, а не с двумя.
+    """
+    app, bot, _ = wired
+    anna = FakeUser(10, first_name="Аня", username="anna")
+    boris = FakeUser(20, first_name="Борис", username="boris")
+    anna_chat = FakeChat(boris.id, type="private")  # Аня видит чат с Борисом
+    boris_chat = FakeChat(anna.id, type="private")  # Борис видит чат с Аней
+
+    summon = FakeGuestMessage("@test_bot", anna, anna_chat)
+    await handle_chat_message(app, summon)
+    contract = app.store.for_chat("p10:20")
+    assert contract is not None
+    first_card = contract.inline_message_id
+
+    # Борис вызывает бота у себя — это тот же контракт, карточка переезжает
+    summon_b = FakeGuestMessage("@test_bot", boris, boris_chat, query_id="q2")
+    await handle_chat_message(app, summon_b)
+    assert app.store.active_count == 1
+    assert app.store.open_for_chat("p10:20") is contract
+    assert contract.inline_message_id != first_card
+
+    # Борис подписывает свою сторону в своей «версии» чата
+    await press(app, f"sg:{contract.token}:classic:party2", boris, contract.inline_message_id)
+    await handle_chat_message(
+        app, reply_to_bot("Борис Б.", boris, contract, chat=boris_chat, query_id="r2")
+    )
+    assert contract.signatures["party2"].user_id == boris.id
+
+    # Аня подписывает свою — контракт финализируется, хотя chat_id у всех разный
+    await press(app, f"sg:{contract.token}:classic:party1", anna, contract.inline_message_id)
+    await handle_chat_message(
+        app, reply_to_bot("Анна А.", anna, contract, chat=anna_chat, query_id="r1")
+    )
+    assert contract.state == STATE_SIGNED
+    assert {key for key in contract.signatures} == {"party1", "party2"}
+    assert bot.edits[-1]["media"].media == "signed-file-id"
+
+
+@pytest.mark.asyncio
+async def test_private_chat_second_person_reply_without_summon(wired):
+    """Второй человек в личке просто нажимает кнопку и отвечает — без @бот."""
+    app, _, _ = wired
+    anna = FakeUser(10)
+    boris = FakeUser(20)
+    anna_chat = FakeChat(boris.id, type="private")
+    boris_chat = FakeChat(anna.id, type="private")
+
+    await handle_chat_message(app, FakeGuestMessage("@test_bot", anna, anna_chat))
+    contract = app.store.for_chat("p10:20")
+
+    await press(app, f"sg:{contract.token}:classic:party2", boris, contract.inline_message_id)
+    quiet = reply_to_bot("Борис", boris, contract, chat=boris_chat, query_id="r2")
+    await handle_chat_message(app, quiet)
+
+    assert contract.signatures["party2"].text == "Борис"
+    assert "Сторона 2" in quiet.answers[-1].input_message_content.message_text
+
+
+@pytest.mark.asyncio
+async def test_forum_threads_do_not_split_contract(wired):
+    """Темы форума — один чат: второй @бот не создаёт второй контракт."""
+    app, _, _ = wired
+    anna = FakeUser(10)
+    chat = FakeChat(-100500)
+
+    await handle_chat_message(
+        app, FakeGuestMessage("@test_bot", anna, chat, thread_id=7)
+    )
+    contract = app.store.for_chat("g-100500")
+    await handle_chat_message(
+        app, FakeGuestMessage("@test_bot", anna, chat, query_id="q2")
+    )
+    assert app.store.active_count == 1
+    assert app.store.open_for_chat("g-100500") is contract
+
+
+@pytest.mark.asyncio
+async def test_reply_to_guest_message_attributed_to_invoker(wired):
+    """Guest-сообщение бота может прийти «от имени» вызвавшего — это всё равно ответ боту."""
+    app, _, _ = wired
+    anna = FakeUser(10, first_name="Аня")
+    boris = FakeUser(20, first_name="Борис")
+    chat = FakeChat(-100500)
+
+    await handle_chat_message(app, FakeGuestMessage("@test_bot", anna, chat))
+    contract = app.store.for_chat("g-100500")
+    await press(app, f"sg:{contract.token}:classic:party2", boris, contract.inline_message_id)
+
+    reply = reply_to_bot("Борис", boris, contract, chat=chat)
+    # сервер отдал карточку бота как сообщение Анны, но с guest-полями бота
+    reply.reply_to_message = types.SimpleNamespace(
+        from_user=anna, guest_bot_caller_user=anna, message_id=555
+    )
+    reply.guest_query_id = ""
+    await handle_chat_message(app, reply)
+
+    assert contract.signatures["party2"].text == "Борис"
 
 
 @pytest.mark.asyncio

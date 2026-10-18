@@ -7,6 +7,7 @@ import html
 import logging
 import secrets
 import time
+from collections import deque
 from typing import Iterable
 
 from aiogram import Bot, Dispatcher
@@ -59,6 +60,9 @@ class App:
         self.started_at = time.time()
         self._cleanup_task: asyncio.Task[None] | None = None
         self._warmup_lock = asyncio.Lock()
+        # Короткая история событий: /debug показывает её владельцу, когда
+        # «в чате что-то не так», а доступа к логам сервера нет.
+        self.events: deque[str] = deque(maxlen=120)
 
         # Imported lazily to avoid a circular import at module load time.
         from .handlers import build_router
@@ -134,6 +138,27 @@ class App:
     async def ensure_templates_ready(self) -> tuple[int, int]:
         async with self._warmup_lock:
             return await self.storage.warmup(self.bot)
+
+    # -- diagnostics -------------------------------------------------------
+
+    def note(self, event: str) -> None:
+        self.events.append(f"{time.strftime('%H:%M:%S')} {event}")
+
+    def recent_events(self, limit: int = 40) -> list[str]:
+        return list(self.events)[-limit:]
+
+    def contracts_report(self) -> list[str]:
+        lines: list[str] = []
+        for contract in self.store.contracts():
+            pending = len(self.store.pending_for_contract(contract.token))
+            signed = ",".join(contract.signatures) or "-"
+            inline = (contract.inline_message_id or "-")[:20]
+            lines.append(
+                f"{contract.token} {contract.state} chat={contract.chat_key or '-'} "
+                f"tmpl={contract.template_key} inline={inline} "
+                f"msg={contract.message_id or '-'} signed={signed} pending={pending}"
+            )
+        return lines
 
     # -- template helpers -------------------------------------------------
 

@@ -214,6 +214,26 @@ class ContractStore:
                 return pending.user_id
         return None
 
+    def unique_pending(self, user_id: int) -> PendingSignature | None:
+        """Единственное ожидание ввода у человека — если их ровно одно.
+
+        Нужно как запасной вариант для ответов, у которых не совпал ключ чата
+        (тема форума, guest-контекст): подписывать «наугад» чужой контракт
+        нельзя, а при одном ожидании ошибиться негде.
+        """
+        now = time.time()
+        live: list[PendingSignature] = []
+        for key, pending in list(self._pending.items()):
+            if pending.expired(now):
+                self._pending.pop(key, None)
+                continue
+            if pending.user_id == user_id:
+                live.append(pending)
+        return live[0] if len(live) == 1 else None
+
+    def contracts(self) -> list[Contract]:
+        return list(self._by_token.values())
+
     @property
     def active_count(self) -> int:
         return len(self._by_token)
@@ -286,6 +306,23 @@ class ContractStore:
     def unbind_inline(self, inline_message_id: str | None) -> None:
         if inline_message_id:
             self._by_inline.pop(inline_message_id, None)
+
+    def bind_message(
+        self,
+        contract: Contract,
+        *,
+        chat_id: int,
+        message_id: int,
+        chat_key: str | None = None,
+    ) -> None:
+        """Переключить правки на обычное сообщение бота (бот в чате)."""
+        self.unbind_inline(contract.inline_message_id)
+        contract.inline_message_id = None
+        contract.chat_id = chat_id
+        contract.message_id = message_id
+        if chat_key:
+            contract.chat_key = chat_key
+        contract.touch()
 
     def drop(self, contract: Contract) -> None:
         self._by_token.pop(contract.token, None)

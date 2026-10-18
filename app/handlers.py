@@ -33,8 +33,9 @@ from aiogram.types import (
 )
 
 from . import ui
+from .config import TemplateConfig
 from .render import validate_signature
-from .store import STATE_OPEN, STATE_SIGNED, Contract, chat_key, new_token
+from .store import STATE_SIGNED, Contract, chat_key, new_token
 
 if TYPE_CHECKING:  # pragma: no cover
     from .app import App
@@ -217,72 +218,44 @@ async def handle_chosen_inline_result(app: "App", result: ChosenInlineResult) ->
         app.store.bind_inline(contract, result.inline_message_id)
 
 
-async def handle_inline_sign_press(
-    app: "App", query: CallbackQuery, payload: str
+async def _handle_inline_sign_press(
+    app: "App",
+    query: CallbackQuery,
+    token: str,
+    template_key: str,
+    field_key: str,
 ) -> None:
-    """A sign button on an inline message was pressed.
+    """Кнопка стороны на inline-сообщении: открыть личку с подсказкой.
 
-    The callback always carries ``inline_message_id``, so this is where the
-    contract really becomes bound to the message.
+    Callback всегда несёт ``inline_message_id``, поэтому контракт можно
+    восстановить, даже если бот перезапускался.
     """
-    token, _, tail = payload.partition(":")
-    template_key, _, field_key = tail.partition(":")
-    template = app.config.templates.get(template_key)
-    if template is None or field_key not in template.fields:
-        await query.answer(app.config.text("callback.expired", bot=app.bot_username))
+    contract = _resolve_contract(app, query, token, template_key, query.from_user)
+    if contract is None:
+        await query.answer(_callback_expired(app))
         return
 
-    user = query.from_user
-    contract = _contract_for_callback(app, query, token, template_key, user)
+    template = _template_for(app, contract, template_key)
+    field = template.fields.get(field_key) if template else None
+    if template is None or field is None:
+        await query.answer(_callback_expired(app))
+        return
 
     if contract.state == STATE_SIGNED:
         await query.answer(app.config.text("callback.done"))
         return
-
-    field = template.fields[field_key]
     if field_key in contract.signatures:
         await query.answer(app.config.text("callback.already_signed", label=field.label))
         return
 
     holder = app.store.pending_holder(contract.token, field_key)
-    if holder is not None and holder != user.id:
+    if holder is not None and holder != query.from_user.id:
         await query.answer(app.config.text("callback.waiting"))
         return
 
-    deep_link = f"{DEEPLINK_PREFIX}{contract.token}_{field_key}"
-    url = f"https://t.me/{app.bot_username}?start={deep_link}"
+    payload = f"{DEEPLINK_PREFIX}{contract.token}_{field_key}"
+    url = f"https://t.me/{app.bot_username}?start={payload}"
     await query.answer(app.config.text("inline.opening_dm"), url=url)
-
-
-def _contract_for_callback(
-    app: "App", query: CallbackQuery, token: str, template_key: str, user: User
-) -> Contract:
-    """Resolve the contract behind an inline message.
-
-    ``inline_message_id`` wins over the token: the same inline result can be
-    sent into several chats, and each copy must be edited independently.
-    """
-    bound = app.store.for_inline(query.inline_message_id)
-    if bound is not None:
-        return bound
-
-    contract = app.store.get(token)
-    if contract is not None and contract.inline_message_id:
-        # The token belongs to a copy in another chat — give this one its own.
-        contract = None
-
-    if contract is None:
-        contract = app.store.create(
-            template_key=template_key,
-            inline_message_id=query.inline_message_id,
-            initiator_id=user.id,
-            initiator_name=_user_name(user),
-            token=token if app.store.get(token) is None else None,
-        )
-    elif not contract.inline_message_id and query.inline_message_id:
-        app.store.bind_inline(contract, query.inline_message_id)
-    contract.state = STATE_OPEN
-    return contract
 
 
 # ---------------------------------------------------------------------------
@@ -446,11 +419,8 @@ async def handle_guest(app: "App", message: Message) -> None:
     if template is None:
         template = templates[0]
 
-    if contract is not None:
-        # Replacing an old contract: drop it silently. Its buttons will answer
-        # "контракт неактуален" because the token is gone.
-        app.store.drop(contract)
-
+    # Не затираем предыдущий контракт чата: у каждого сообщения свой токен,
+    # иначе кнопки у второго участника отвечают «неактуально».
     contract = app.store.create(
         chat_key=key,
         template_key=template.key,
@@ -470,30 +440,43 @@ async def handle_guest(app: "App", message: Message) -> None:
 
 async def handle_callback(app: "App", query: CallbackQuery) -> None:
     action, _, rest = (query.data or "").partition(":")
-
-    if action == "isg":
-        await handle_inline_sign_press(app, query, rest)
-        return
-
     token, _, argument = rest.partition(":")
+    user = query.from_user
+
+    log.info(
+        "callback %s token=%s user=%s inline=%s",
+        action,
+        token or "-",
+        user.id,
+        (query.inline_message_id or "-")[:14],
+    )
 
     if action in {"pv", "pn", "pk"}:
         await _handle_preview(app, query, token, argument, pick=(action == "pk"))
         return
 
-    contract = app.store.get(token)
-    if _stale(app, query, contract):
-        await query.answer(_callback_expired(app))
+    if action == "sg":
+        template_key, field_key = _split_side(argument)
+        await _handle_sign_press(app, query, token, template_key, field_key)
         return
 
-    if action == "sg":
-        await _handle_sign_press(app, query, contract, argument)
+    if action == "isg":
+        template_key, field_key = _split_side(argument)
+        await _handle_inline_sign_press(
+            app, query, token, template_key, field_key
+        )
         return
+
     if action == "cx":
-        await _handle_cancel(app, query, contract)
+        await _handle_cancel(app, query, token)
         return
+
     if action == "no":
-        await query.answer(app.config.text("callback.signed"))
+        contract = app.store.for_inline(query.inline_message_id) or app.store.get(token)
+        if contract is not None and contract.state == STATE_SIGNED:
+            await query.answer(app.config.text("callback.done"))
+        else:
+            await query.answer(app.config.text("callback.signed"))
         return
 
     await query.answer(app.config.text("errors.generic"))
@@ -503,25 +486,111 @@ def _callback_expired(app: "App") -> str:
     return app.config.text("callback.expired", bot=app.bot_username)
 
 
-def _stale(app: "App", query: CallbackQuery, contract: Contract | None) -> bool:
+def _template_for(
+    app: "App", contract: Contract, template_key: str
+) -> TemplateConfig | None:
+    """Шаблон контракта: он важнее того, что написано в кнопке."""
+    template = app.config.templates.get(contract.template_key)
+    if template is not None:
+        return template
+    template = app.config.templates.get(template_key) if template_key else None
+    if template is not None:
+        return template
+    ordered = app.config.templates.ordered()
+    return ordered[0] if ordered else None
+
+
+def _split_side(argument: str) -> tuple[str, str]:
+    """``template:field`` (new) or just ``field`` (buttons sent before v2)."""
+    head, _, tail = argument.partition(":")
+    if tail:
+        return head, tail
+    return "", head
+
+
+def _chat_key_from(query: CallbackQuery) -> str | None:
+    message = getattr(query, "message", None)
+    if message is None or getattr(message, "chat", None) is None:
+        return None
+    return chat_key(message.chat.id, getattr(message, "message_thread_id", None))
+
+
+def _resolve_contract(
+    app: "App",
+    query: CallbackQuery,
+    token: str,
+    template_key: str,
+    user: User,
+) -> Contract | None:
+    """Найти контракт за кнопкой, при необходимости собрав его заново.
+
+    Состояние живёт только в RAM, поэтому кнопка — это ещё и инструкция,
+    как восстановить контракт: ``token`` + ``template_key`` + сторона.
+    Так старые сообщения продолжают работать после перезапуска бота.
+    """
+    inline_id = query.inline_message_id
+
+    if inline_id:
+        bound = app.store.for_inline(inline_id)
+        if bound is not None:
+            return bound
+
+    contract = app.store.get(token)
+
+    if contract is not None:
+        if not inline_id:
+            return contract
+        if contract.inline_message_id == inline_id:
+            return contract
+        if not contract.inline_message_id:
+            app.store.bind_inline(contract, inline_id)
+            return contract
+        # Тот же inline-результат отправлен во второй чат: у копии своя жизнь.
+        contract = None
+
+    template = app.config.templates.get(template_key) if template_key else None
+    if template is None:
+        template = _fallback_template(app, query)
+
+    if template is None:
+        return None
+
+    message = getattr(query, "message", None)
+    log.info(
+        "восстанавливаю контракт по кнопке: token=%s template=%s inline=%s",
+        token or "-",
+        template.key,
+        (inline_id or "-")[:14],
+    )
+    return app.store.create(
+        template_key=template.key,
+        chat_key=None if inline_id else _chat_key_from(query),
+        inline_message_id=inline_id,
+        chat_id=getattr(getattr(message, "chat", None), "id", None),
+        message_id=getattr(message, "message_id", None),
+        initiator_id=user.id,
+        initiator_name=_user_name(user),
+        token=token if token and app.store.get(token) is None else None,
+    )
+
+
+def _fallback_template(app: "App", query: CallbackQuery) -> TemplateConfig | None:
+    """Шаблон для кнопок, отправленных до того, как в callback попал ключ."""
+    key = _chat_key_from(query)
+    if not key:
+        return None
+    contract = app.store.for_chat(key)
     if contract is None:
-        return True
-    if contract.state == STATE_SIGNED:
-        return True
-    if (
-        query.inline_message_id
-        and contract.inline_message_id
-        and query.inline_message_id != contract.inline_message_id
-    ):
-        return True
-    return False
+        return None
+    return app.config.templates.get(contract.template_key)
 
 
 async def _handle_preview(
     app: "App", query: CallbackQuery, token: str, argument: str, *, pick: bool
 ) -> None:
     contract = app.store.get(token)
-    if _stale(app, query, contract):
+    if contract is None:
+        # Превью не восстановить: в callback_data только токен.
         await query.answer(_callback_expired(app))
         return
 
@@ -553,15 +622,28 @@ async def _handle_preview(
 
 
 async def _handle_sign_press(
-    app: "App", query: CallbackQuery, contract: Contract, field_key: str
+    app: "App",
+    query: CallbackQuery,
+    token: str,
+    template_key: str,
+    field_key: str,
 ) -> None:
-    template = app.template_or_first(contract.template_key)
+    contract = _resolve_contract(app, query, token, template_key, query.from_user)
+    if contract is None:
+        await query.answer(_callback_expired(app))
+        return
+
+    template = _template_for(app, contract, template_key)
     if template is None:
         await query.answer(app.config.text("errors.no_templates"))
         return
     field = template.fields.get(field_key)
     if field is None:
         await query.answer(app.config.text("errors.generic"))
+        return
+
+    if contract.state == STATE_SIGNED:
+        await query.answer(app.config.text("callback.done"))
         return
     if field_key in contract.signatures:
         await query.answer(app.config.text("callback.already_signed", label=field.label))
@@ -579,7 +661,12 @@ async def _handle_sign_press(
     await query.answer("" if ok else app.config.text("errors.generic"))
 
 
-async def _handle_cancel(app: "App", query: CallbackQuery, contract: Contract) -> None:
+async def _handle_cancel(app: "App", query: CallbackQuery, token: str) -> None:
+    contract = app.store.for_inline(query.inline_message_id) or app.store.get(token)
+    if contract is None:
+        await query.answer(_callback_expired(app))
+        return
+
     holders = {pending.user_id for pending in app.store.pending_for_contract(contract.token)}
     allowed = query.from_user.id in {contract.initiator_id, *holders}
     if not allowed:

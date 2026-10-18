@@ -47,7 +47,7 @@ def contract_markup(cfg: ConfigManager, token: str, template: TemplateConfig) ->
         row.append(
             InlineKeyboardButton(
                 text=_sign_button_text(cfg, field.label),
-                callback_data=f"sg:{token}:{field.key}",
+                callback_data=f"sg:{token}:{template.key}:{field.key}",
             )
         )
         if len(row) == 2:
@@ -69,7 +69,7 @@ def signed_buttons_markup(
             callback_data = f"no:{token}"
         else:
             label = _sign_button_text(cfg, field.label)
-            callback_data = f"sg:{token}:{field.key}"
+            callback_data = f"sg:{token}:{template.key}:{field.key}"
         rows.append([InlineKeyboardButton(text=label, callback_data=callback_data)])
     rows.append([InlineKeyboardButton(text=_q(cfg, "buttons.cancel"), callback_data=f"cx:{token}")])
     return InlineKeyboardMarkup(inline_keyboard=rows)

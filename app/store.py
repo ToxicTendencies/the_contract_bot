@@ -55,6 +55,8 @@ class Contract:
     template_key: str
     chat_key: str | None = None
     inline_message_id: str | None = None
+    chat_id: int | None = None
+    message_id: int | None = None
     initiator_id: int = 0
     initiator_name: str = ""
     state: str = STATE_PREVIEW
@@ -93,8 +95,12 @@ class ContractStore:
         self.ttl_seconds = ttl_seconds
         self.pending_seconds = pending_seconds
         self.max_active = max_active
+        # В чате может жить несколько контрактов: у каждого сообщения свой
+        # токен, иначе кнопки в предыдущем сообщении умирают, как только
+        # кто-то вызвал бота ещё раз.
+        self.max_per_chat = 5
         self._by_token: dict[str, Contract] = {}
-        self._by_chat: dict[str, str] = {}
+        self._chat_tokens: dict[str, list[str]] = {}
         self._by_inline: dict[str, str] = {}
         self._pending: dict[int, PendingSignature] = {}
 
@@ -106,8 +112,12 @@ class ContractStore:
         return self._by_token.get(token)
 
     def for_chat(self, chat_key: str) -> Contract | None:
-        token = self._by_chat.get(chat_key)
-        return self._by_token.get(token) if token else None
+        """Самый свежий живой контракт чата."""
+        for token in reversed(self._chat_tokens.get(chat_key, [])):
+            contract = self._by_token.get(token)
+            if contract is not None:
+                return contract
+        return None
 
     def for_inline(self, inline_message_id: str | None) -> Contract | None:
         if not inline_message_id:
@@ -151,16 +161,13 @@ class ContractStore:
         template_key: str,
         chat_key: str | None = None,
         inline_message_id: str | None = None,
+        chat_id: int | None = None,
+        message_id: int | None = None,
         initiator_id: int = 0,
         initiator_name: str = "",
         page: int = 0,
         token: str | None = None,
     ) -> Contract:
-        if chat_key:
-            previous = self.for_chat(chat_key)
-            if previous is not None:
-                self.drop(previous)
-
         token = token or new_token()
         while token in self._by_token:
             token = new_token()
@@ -170,17 +177,28 @@ class ContractStore:
             template_key=template_key,
             chat_key=chat_key,
             inline_message_id=inline_message_id or None,
+            chat_id=chat_id,
+            message_id=message_id,
             initiator_id=initiator_id,
             initiator_name=initiator_name,
             page=page,
         )
         self._by_token[token] = contract
         if chat_key:
-            self._by_chat[chat_key] = token
+            self._chat_tokens.setdefault(chat_key, []).append(token)
+            self._trim_chat(chat_key)
         if inline_message_id:
             self._by_inline[inline_message_id] = token
         self._enforce_cap()
         return contract
+
+    def _trim_chat(self, chat_key: str) -> None:
+        tokens = self._chat_tokens.get(chat_key, [])
+        while len(tokens) > self.max_per_chat:
+            oldest = tokens.pop(0)
+            contract = self._by_token.get(oldest)
+            if contract is not None:
+                self.drop(contract)
 
     def bind_inline(self, contract: Contract, inline_message_id: str) -> None:
         contract.inline_message_id = inline_message_id
@@ -189,8 +207,12 @@ class ContractStore:
 
     def drop(self, contract: Contract) -> None:
         self._by_token.pop(contract.token, None)
-        if contract.chat_key and self._by_chat.get(contract.chat_key) == contract.token:
-            self._by_chat.pop(contract.chat_key, None)
+        if contract.chat_key:
+            tokens = self._chat_tokens.get(contract.chat_key)
+            if tokens and contract.token in tokens:
+                tokens.remove(contract.token)
+            if not tokens:
+                self._chat_tokens.pop(contract.chat_key, None)
         if (
             contract.inline_message_id
             and self._by_inline.get(contract.inline_message_id) == contract.token
@@ -288,7 +310,7 @@ class ContractStore:
 
     def clear(self) -> None:
         self._by_token.clear()
-        self._by_chat.clear()
+        self._chat_tokens.clear()
         self._by_inline.clear()
         self._pending.clear()
 

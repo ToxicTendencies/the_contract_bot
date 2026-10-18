@@ -21,11 +21,34 @@ def test_create_and_lookup():
     assert contract.state == STATE_PREVIEW
 
 
-def test_one_contract_per_chat():
+def test_contracts_in_chat_coexist():
+    """Новое сообщение в чате не убивает кнопки предыдущего."""
     store = make_store()
     first = store.create(chat_key="g1", template_key="classic", initiator_id=10)
     second = store.create(chat_key="g1", template_key="minimal", initiator_id=10)
-    assert store.get(first.token) is None
+    assert store.get(first.token) is first
+    assert store.get(second.token) is second
+    assert store.for_chat("g1") is second
+
+
+def test_chat_keeps_limited_history():
+    store = make_store()
+    contracts = [
+        store.create(chat_key="g1", template_key="classic", initiator_id=10)
+        for _ in range(store.max_per_chat + 2)
+    ]
+    assert store.get(contracts[0].token) is None
+    assert store.get(contracts[1].token) is None
+    assert store.get(contracts[-1].token) is contracts[-1]
+    assert store.for_chat("g1") is contracts[-1]
+
+
+def test_dropped_contract_leaves_chat():
+    store = make_store()
+    first = store.create(chat_key="g1", template_key="classic", initiator_id=10)
+    store.drop(first)
+    assert store.for_chat("g1") is None
+    second = store.create(chat_key="g1", template_key="classic", initiator_id=10)
     assert store.for_chat("g1") is second
 
 

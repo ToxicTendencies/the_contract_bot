@@ -226,12 +226,17 @@ class App:
         if not file_id:
             log.warning("Нет file_id для бланка %s", template.key)
             return False
-        if not contract.inline_message_id:
-            log.warning("У контракта %s нет inline_message_id", contract.token)
+        if not contract.inline_message_id and not (
+            contract.chat_id and contract.message_id
+        ):
+            log.warning("Контракт %s не привязан к сообщению", contract.token)
             return False
+        target: dict[str, object] = {"inline_message_id": contract.inline_message_id}
+        if not contract.inline_message_id:
+            target = {"chat_id": contract.chat_id, "message_id": contract.message_id}
         try:
             await self.bot.edit_message_media(
-                inline_message_id=contract.inline_message_id,
+                **target,
                 media=InputMediaPhoto(
                     media=file_id,
                     caption=caption,

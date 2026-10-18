@@ -244,7 +244,7 @@ async def test_signed_contract_rejects_callbacks(app, patched):
     contract.state = STATE_SIGNED
     callback = FakeCallback(data=f"sg:{contract.token}:party1", user=FakeUser(1))
     await handle_callback(app, callback)
-    assert callback.answers and "неактуален" in callback.answers[-1]
+    assert callback.answers[-1] == app.config.text("callback.done")
 
 
 @pytest.mark.asyncio

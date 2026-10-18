@@ -49,15 +49,15 @@ class App:
         self.bot_username: str = ""
         self.bot_id: int = 0
         self.guest_mode_enabled = False
+        self.inline_mode_enabled = False
         self.started_at = time.time()
         self._cleanup_task: asyncio.Task[None] | None = None
         self._warmup_lock = asyncio.Lock()
 
         # Imported lazily to avoid a circular import at module load time.
-        from .handlers import build_dm_router, build_guest_router
+        from .handlers import build_router
 
-        self.dp.include_router(build_guest_router(self))
-        self.dp.include_router(build_dm_router(self))
+        self.dp.include_router(build_router(self))
         config.on_reload(self._on_config_reload)
 
     # -- lifecycle -------------------------------------------------------
@@ -67,11 +67,13 @@ class App:
         self.bot_username = me.username or ""
         self.bot_id = me.id
         self.guest_mode_enabled = bool(getattr(me, "supports_guest_queries", False))
+        self.inline_mode_enabled = bool(getattr(me, "supports_inline_queries", False))
         log.info(
-            "Бот @%s (id=%s), guest mode: %s",
+            "Бот @%s (id=%s), inline: %s, guest: %s",
             self.bot_username,
             self.bot_id,
-            "включён" if self.guest_mode_enabled else "ВЫКЛЮЧЕН",
+            "вкл" if self.inline_mode_enabled else "выкл",
+            "вкл" if self.guest_mode_enabled else "выкл",
         )
 
         ready, total = await self.storage.warmup(self.bot)
@@ -79,8 +81,10 @@ class App:
 
         self._cleanup_task = asyncio.create_task(self._cleanup_loop(), name="cleanup")
 
-        if not self.guest_mode_enabled:
-            await self.notify_owner(self.config.text("dm.guest_mode_disabled"))
+        if not self.inline_mode_enabled and not self.guest_mode_enabled:
+            await self.notify_owner(self.config.text("dm.no_modes_enabled"))
+        elif not self.inline_mode_enabled:
+            await self.notify_owner(self.config.text("dm.inline_mode_disabled"))
         if ready < total:
             await self.notify_owner(
                 self.config.text("dm.warmup_partial", ok=ready, total=total)
@@ -293,17 +297,25 @@ class App:
         signed = set(contract.signatures)
         remaining = [field.label for key, field in template.fields.items() if key not in signed]
         field = template.fields.get(field_key)
-        caption = self.config.text(
-            "guest.one_signed",
-            label=html.escape(field.label if field else field_key),
-            remaining=html.escape(", ".join(remaining)),
-        )
-        return await self.edit_contract(
-            contract,
-            template,
-            caption,
-            ui.signed_buttons_markup(self.config, contract.token, template, signed),
-        )
+        if contract.inline_message_id and contract.chat_key is None:
+            caption = ui.inline_progress_caption(
+                self.config,
+                template,
+                field.label if field else field_key,
+                ", ".join(remaining),
+                self.max_length_for(template),
+            )
+            markup = ui.inline_signed_markup(self.config, contract.token, template, signed)
+        else:
+            caption = self.config.text(
+                "guest.one_signed",
+                label=html.escape(field.label if field else field_key),
+                remaining=html.escape(", ".join(remaining)),
+            )
+            markup = ui.signed_buttons_markup(
+                self.config, contract.token, template, signed
+            )
+        return await self.edit_contract(contract, template, caption, markup)
 
     async def mark_expired(self, contract: Contract) -> None:
         template = self.template_or_first(contract.template_key)
@@ -351,8 +363,9 @@ class App:
             log.exception("Неожиданная ошибка рендера контракта %s", contract.token)
             return False
 
+        archive_caption = ui.owner_caption(self.config, template, contract)
         try:
-            file_id = await self.storage.upload_signed(self.bot, data, template.title)
+            file_id = await self.storage.upload_signed(self.bot, data, archive_caption)
         except Exception:  # noqa: BLE001
             log.exception("Не удалось загрузить подписанный контракт %s", contract.token)
             return False
@@ -380,8 +393,11 @@ class App:
         except Exception as exc:  # noqa: BLE001
             log.warning("Не удалось показать финал для %s: %s", contract.token, exc)
 
+        # Keep the finished contract in RAM until TTL so stale buttons answer
+        # "уже подписан" instead of silently starting a new one. Only signature
+        # text is stored — the image is rendered on demand.
         contract.state = STATE_SIGNED
-        self.store.drop(contract)
+        contract.touch()
         return True
 
     # -- housekeeping ------------------------------------------------------
@@ -399,11 +415,28 @@ class App:
 
     async def cleanup_once(self) -> None:
         now = time.time()
-        for contract in self.store.expire_pending(now):
+        expired = self.store.expire_pending(now)
+        touched = {pending.token for pending in expired}
+        for pending in expired:
+            contract = self.store.get(pending.token)
+            if contract is None or contract.chat_key is not None:
+                continue  # guest chats get their buttons back below
+            try:
+                await self.bot.send_message(
+                    pending.user_id, self.config.text("dm.prompt_expired")
+                )
+            except Exception:  # noqa: BLE001 - user may have blocked the bot
+                pass
+        for token in touched:
+            contract = self.store.get(token)
+            if contract is None or contract.chat_key is None:
+                continue
             template = self.template_or_first(contract.template_key)
-            if template is not None and contract.inline_message_id:
+            if template is not None and contract.state != STATE_SIGNED:
                 await self.restore_contract_view(contract, template)
         for contract in self.store.pop_stale(now):
+            if contract.state == STATE_SIGNED:
+                continue  # finished long ago, forget it silently
             if contract.inline_message_id:
                 await self.mark_expired(contract)
 

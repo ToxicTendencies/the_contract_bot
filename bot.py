@@ -42,10 +42,12 @@ async def run() -> None:
 
     allowed = app.dp.resolve_used_update_types()
     log.info("Подписки на апдейты: %s", ", ".join(sorted(allowed)))
+    if "inline_query" not in allowed:
+        log.error("inline_query не попал в allowed_updates — @бот не покажет бланки")
     if "guest_message" not in allowed:
-        log.error(
-            "guest_message не попал в allowed_updates — упоминания в чужих чатах "
-            "не будут приходить"
+        log.warning(
+            "guest_message не попал в allowed_updates — упоминания без inline "
+            "работать не будут"
         )
 
     watcher = asyncio.create_task(watch_config(config), name="config-watcher")
@@ -63,13 +65,24 @@ async def check() -> int:
     app = App(config)
     try:
         me = await app.bot.me()
+        inline = bool(getattr(me, "supports_inline_queries", False))
         guest = bool(getattr(me, "supports_guest_queries", False))
         print(f"Бот: @{me.username} (id={me.id})")
-        print(f"Guest Mode: {'включён' if guest else 'ВЫКЛЮЧЕН — включи в Mini App @BotFather'}")
+        print(f"Inline mode: {'включён' if inline else 'ВЫКЛЮЧЕН — /setinline в @BotFather'}")
+        print(f"Guest Mode: {'включён' if guest else 'выключен (не обязателен)'}")
         print(f"Бланков в конфиге: {len(config.templates)}")
+        for template in config.templates.ordered():
+            print(f"  • {template.key}: {template.inline_name} ({len(template.fields)} поля)")
         print(f"STORAGE_CHAT_ID: {config.settings.storage_chat_id}")
         print(f"OWNER_ID: {config.settings.owner_id}")
-        return 0 if guest else 1
+        if not inline:
+            print(
+                "Без inline-режима @бот не покажет бланки. "
+                "Guest mode тоже выключен — упоминания работать не будут."
+                if not guest
+                else "Inline выключен: останется только guest-сценарий."
+            )
+        return 0 if inline or guest else 1
     finally:
         await app.bot.session.close()
 

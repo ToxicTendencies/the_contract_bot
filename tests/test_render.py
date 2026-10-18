@@ -4,7 +4,7 @@ import io
 
 from PIL import Image
 
-from app.config import Box, Limits
+from app.config import Box
 from app.render import (
     count_graphemes,
     layout_text,

@@ -3,8 +3,10 @@ from __future__ import annotations
 from aiogram.types import Update
 
 
-def test_dispatcher_subscribes_to_guest_and_dm(app):
+def test_dispatcher_subscribes_to_all_entry_points(app):
     used = app.dp.resolve_used_update_types()
+    assert "inline_query" in used
+    assert "chosen_inline_result" in used
     assert "guest_message" in used
     assert "callback_query" in used
     assert "message" in used
@@ -79,3 +81,27 @@ def test_answer_guest_query_payload(app):
     payload = method.model_dump(exclude_none=True)
     assert payload["result"]["type"] == "photo"
     assert payload["result"]["photo_file_id"] == "file-id"
+
+
+def test_tokens_are_url_safe(app):
+    from app.store import new_token
+
+    token = new_token()
+    assert len(token) == 8
+    assert all(char in "0123456789abcdef" for char in token)
+
+
+def test_inline_payloads_fit_telegram_limits(app):
+    from app import ui
+    from app.store import new_token
+
+    token = new_token()
+    for template in app.templates():
+        markup = ui.inline_sign_markup(app.config, token, template)
+        for row in markup.inline_keyboard:
+            for button in row:
+                assert len(button.callback_data.encode()) <= 64
+        # deep link: https://t.me/<bot>?start=s_<token>_<field>
+        for field_key in template.fields:
+            payload = f"s_{token}_{field_key}"
+            assert len(payload) <= 64

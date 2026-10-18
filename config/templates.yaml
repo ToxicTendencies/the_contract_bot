@@ -39,6 +39,11 @@ templates:
     title: "Классический договор"
     description: "Строгий бланк · две подписи"
     tags: ["классика", "строгий", "договор"]
+    # Название и слова для inline-режима: @бот классика
+    inline:
+      title: "Классический договор"
+      description: "Строгий бланк · две подписи"
+      keywords: ["услуги", "официальный", "серьёзный", "работа"]
     fields:
       party1:
         label: "Сторона 1"
@@ -60,6 +65,10 @@ templates:
     title: "Минималистичный"
     description: "Лёгкий бланк · две подписи"
     tags: ["минимализм", "лёгкий", "соглашение"]
+    inline:
+      title: "Минималистичное соглашение"
+      description: "Белый лист · короткие условия"
+      keywords: ["простое", "быстрое", "короткое", "минимал"]
     fields:
       party1:
         label: "Сторона 1"
@@ -82,6 +91,10 @@ templates:
     title: "Ночной контракт"
     description: "Тёмный бланк · золото"
     tags: ["тёмный", "ночной", "золото"]
+    inline:
+      title: "Ночной контракт"
+      description: "Тёмный фон · золотая рамка"
+      keywords: ["ночь", "тёмная тема", "премиум", "дорогой"]
     fields:
       party1:
         label: "Сторона 1"
@@ -98,4 +111,31 @@ templates:
       font: comic
       font_size: 32
       color: "#d4a24c"
+      align: center
+
+  medieval:
+    file: templates/medieval.png
+    title: "Средневековый контракт"
+    description: "Пергамент, печать, серьёзные намерения"
+    tags: ["средневековый", "средневековье"]
+    inline:
+      title: "Средневековый контракт"
+      description: "Пергамент и печать · подпишитесь, сударь"
+      keywords: ["рыцарь", "пергамент", "свиток", "замок", "феодал", "старина"]
+    fields:
+      party1:
+        label: "Сторона 1"
+        sample: "Барон фон Кот 🐐"
+        box: [80, 1262, 500, 148]
+        color: "#3b2415"
+      party2:
+        label: "Сторона 2"
+        sample: "Сэр Иван"
+        box: [660, 1262, 500, 148]
+        color: "#3b2415"
+    self_sign_note:
+      box: [80, 1470, 1080, 74]
+      font: serif
+      font_size: 30
+      color: "#8b2f1d"
       align: center

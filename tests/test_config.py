@@ -93,3 +93,50 @@ def test_find_template():
     assert templates.find("Классический договор").key == "classic"
     assert templates.find("минимализм").key == "minimal"
     assert templates.find("ерунда") is None
+
+
+def test_inline_metadata():
+    templates = load_templates()
+    medieval = templates.get("medieval")
+    assert medieval is not None
+    assert medieval.inline_name == "Средневековый контракт"
+    assert "Пергамент" in medieval.inline_hint
+    assert "рыцарь" in medieval.keywords
+
+
+def test_find_all_ranking():
+    templates = load_templates()
+    assert [t.key for t in templates.find_all("")] == [
+        "classic",
+        "minimal",
+        "dark",
+        "medieval",
+    ]
+    assert [t.key for t in templates.find_all("средневековый")] == ["medieval"]
+    assert [t.key for t in templates.find_all("рыцарь")] == ["medieval"]
+    assert [t.key for t in templates.find_all("договор")] == ["classic"]
+    assert templates.find_all("ерунда") == []
+
+
+def test_find_all_requires_every_word():
+    templates = load_templates()
+    assert [t.key for t in templates.find_all("ночной контракт")] == ["dark"]
+    assert templates.find_all("ночной средневековый") == []
+
+
+def test_template_key_too_long_is_rejected(tmp_path):
+    config_dir = copy_config(tmp_path)
+    path = config_dir / "templates.yaml"
+    text = path.read_text(encoding="utf-8").replace("  classic:\n", "  very_long_template_key_name:\n")
+    path.write_text(text, encoding="utf-8")
+    with pytest.raises(ConfigError, match="длиннее 16"):
+        load_templates(path, Limits(), strict=True)
+
+
+def test_template_key_rejects_non_ascii(tmp_path):
+    config_dir = copy_config(tmp_path)
+    path = config_dir / "templates.yaml"
+    text = path.read_text(encoding="utf-8").replace("  classic:\n", "  классика:\n")
+    path.write_text(text, encoding="utf-8")
+    with pytest.raises(ConfigError, match="длиннее 16"):
+        load_templates(path, Limits(), strict=True)

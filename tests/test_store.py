@@ -40,19 +40,19 @@ def test_different_chats_coexist():
 def test_pending_expires():
     store = make_store()
     contract = store.create(chat_key="g1", template_key="classic", initiator_id=10)
-    store.set_pending(contract, "party1", 10)
-    assert contract.pending is not None
+    pending = store.set_pending(10, contract, "party1")
+    assert store.pending_for(10) is pending
     expired = store.expire_pending(now=time.time() + 601)
-    assert contract in expired
-    assert contract.pending is None
+    assert pending in expired
+    assert store.pending_for(10) is None
 
 
 def test_pending_not_expired_yet():
     store = make_store()
     contract = store.create(chat_key="g1", template_key="classic", initiator_id=10)
-    store.set_pending(contract, "party1", 10)
-    assert store.expire_pending(now=contract.pending.deadline - 1) == []
-    assert contract.pending is not None
+    pending = store.set_pending(10, contract, "party1")
+    assert store.expire_pending(now=pending.deadline - 1) == []
+    assert store.pending_for(10) is not None
 
 
 def test_ttl_removes_contract():

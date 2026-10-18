@@ -7,8 +7,6 @@ from PIL import Image
 
 from app.store import STATE_SIGNED
 
-from .helpers import FakeChat, FakeMessage, FakeUser
-
 
 class FakeTelegramBot:
     def __init__(self) -> None:
@@ -20,6 +18,9 @@ class FakeTelegramBot:
 
     async def send_message(self, chat_id, text):
         self.sent.append(text)
+
+    async def send_photo(self, chat_id, photo, caption="", parse_mode=None):
+        self.sent.append(caption)
         return None
 
 
@@ -27,12 +28,13 @@ class FakeTelegramBot:
 def finished(app, monkeypatch):
     bot = FakeTelegramBot()
     app.bot = bot
+    app.archived_caption: str | None = None
 
-    async def upload_signed(_bot, data: bytes, title: str) -> str:
+    async def upload_signed(_bot, data: bytes, caption: str) -> str:
         assert data[:2] == b"\xff\xd8"
         image = Image.open(io.BytesIO(data))
         assert image.format == "JPEG"
-        app.last_rendered = image
+        app.archived_caption = caption
         return "signed-file-id"
 
     monkeypatch.setattr(app.storage, "upload_signed", upload_signed)
@@ -40,7 +42,7 @@ def finished(app, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_finalize_edits_message_and_drops_state(app, finished):
+async def test_finalize_edits_message_and_keeps_state(app, finished):
     contract = app.store.create(
         chat_key="g1", template_key="classic", initiator_id=1, initiator_name="A"
     )
@@ -55,7 +57,41 @@ async def test_finalize_edits_message_and_drops_state(app, finished):
     assert edit["inline_message_id"] == "inline-1"
     assert edit["media"].media == "signed-file-id"
     assert "Подписано" in edit["media"].caption
-    assert app.store.get(contract.token) is None
+    # Kept until TTL so stale buttons answer "уже подписан".
+    assert contract.state == STATE_SIGNED
+    assert app.store.get(contract.token) is contract
+
+
+@pytest.mark.asyncio
+async def test_archive_caption_has_profile_links(app, finished):
+    contract = app.store.create(
+        chat_key="g1", template_key="classic", initiator_id=1, initiator_name="A"
+    )
+    contract.inline_message_id = "inline-1"
+    app.store.add_signature(
+        contract,
+        field_key="party1",
+        text="Иванов И.И.",
+        user_id=11,
+        user_name="Иван Иванов",
+        user_username="ivan",
+    )
+    app.store.add_signature(
+        contract,
+        field_key="party2",
+        text="Петров П.П.",
+        user_id=22,
+        user_name="Пётр Петров",
+        user_username="",
+    )
+    template = app.config.templates.get("classic")
+    assert await app.finalize(contract, template) is True
+
+    caption = app.archived_caption or ""
+    assert "https://t.me/ivan" in caption
+    assert "tg://user?id=22" in caption
+    assert "Иванов И.И." in caption
+    assert "Сторона 1" in caption
 
 
 @pytest.mark.asyncio
@@ -68,9 +104,7 @@ async def test_finalize_marks_self_signed(app, finished):
     app.store.add_signature(contract, field_key="party2", text="A", user_id=1, user_name="A")
     template = app.config.templates.get("classic")
     assert await app.finalize(contract, template) is True
-    caption = finished.edits[0]["media"].caption
-    assert app.config.text("guest.self_sign_note") in caption
-    assert contract.state == STATE_SIGNED
+    assert app.config.text("guest.self_sign_note") in finished.edits[0]["media"].caption
 
 
 @pytest.mark.asyncio
@@ -105,3 +139,42 @@ async def test_cleanup_expires_contract(app, monkeypatch):
     await app.cleanup_once()
     assert app.store.get(contract.token) is None
     assert edits and "истёк" in edits[0]["media"].caption.lower()
+
+
+@pytest.mark.asyncio
+async def test_cleanup_forgets_signed_contract_silently(app, monkeypatch):
+    contract = app.store.create(
+        chat_key="g1", template_key="classic", initiator_id=1, initiator_name="A"
+    )
+    contract.state = STATE_SIGNED
+    contract.updated_at -= app.store.ttl_seconds + 1
+
+    async def fail(**kwargs):
+        raise AssertionError("подписанный контракт не должен редактироваться")
+
+    monkeypatch.setattr(app.bot, "edit_message_media", fail)
+    await app.cleanup_once()
+    assert app.store.get(contract.token) is None
+
+
+@pytest.mark.asyncio
+async def test_stale_prompt_notifies_user(app, monkeypatch):
+    contract = app.store.create(
+        template_key="classic", inline_message_id="inline-1", initiator_id=1
+    )
+    app.store.set_pending(55, contract, "party1")
+    app.store._pending[55].deadline -= app.store.pending_seconds + 1
+
+    async def fail(**kwargs):
+        raise AssertionError("сообщение в чате не должно редактироваться")
+
+    monkeypatch.setattr(app.bot, "edit_message_media", fail)
+    sent: list[tuple[int, str]] = []
+
+    async def send_message(chat_id, text):
+        sent.append((chat_id, text))
+
+    app.bot.send_message = send_message
+    await app.cleanup_once()
+    assert sent and sent[0][0] == 55
+    assert "истекло" in sent[0][1].lower() or "истёк" in sent[0][1].lower()

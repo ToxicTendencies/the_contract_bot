@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -369,6 +370,33 @@ class TemplateConfig:
     fields: dict[str, FieldConfig]
     note: NoteConfig | None
     sort: int = 0
+    inline_title: str = ""
+    inline_description: str = ""
+    keywords: tuple[str, ...] = ()
+
+    @property
+    def inline_name(self) -> str:
+        """Title shown in the inline carousel."""
+        return self.inline_title or self.title
+
+    @property
+    def inline_hint(self) -> str:
+        """Subtitle shown under the inline title."""
+        return self.inline_description or self.description
+
+    @property
+    def search_terms(self) -> tuple[str, ...]:
+        """Everything the inline search matches against, lower-cased."""
+        terms = [
+            self.key,
+            self.title,
+            self.description,
+            self.inline_title,
+            self.inline_description,
+            *self.tags,
+            *self.keywords,
+        ]
+        return tuple(term.casefold() for term in terms if term)
 
 
 @dataclass(frozen=True)
@@ -389,21 +417,52 @@ class TemplatesConfig:
     def ordered(self) -> list[TemplateConfig]:
         return list(self.items.values())
 
-    def find(self, query: str) -> TemplateConfig | None:
+    def find_all(self, query: str) -> list[TemplateConfig]:
+        """Rank templates for an inline query.
+
+        ``""`` returns everything.  Otherwise every word of the query must
+        match at least one term of the template, so ``@bot средневековый
+        договор`` still finds a blank tagged with both words.
+        """
         needle = query.strip().casefold()
         if not needle:
-            return None
-        for template in self.items.values():
-            haystack = [template.key, template.title, *template.tags]
-            for value in haystack:
-                if needle == value.casefold():
-                    return template
-        for template in self.items.values():
-            haystack = " ".join([template.key, template.title, *template.tags]).casefold()
-            if needle in haystack:
-                return template
-        return None
+            return self.ordered()
 
+        words = [word for word in needle.split() if word]
+        scored: list[tuple[int, int, TemplateConfig]] = []
+        for position, template in enumerate(self.ordered()):
+            terms = template.search_terms
+            score = 0
+            matched_all = True
+            for word in words:
+                best: int | None = None
+                for term in terms:
+                    if word == term:
+                        best = 0 if best is None else min(best, 0)
+                    elif term.startswith(word):
+                        best = 1 if best is None else min(best, 1)
+                    elif word in term:
+                        best = 2 if best is None else min(best, 2)
+                    elif term in word:
+                        best = 3 if best is None else min(best, 3)
+                if best is None:
+                    matched_all = False
+                    break
+                score += best
+            if matched_all:
+                scored.append((score, position, template))
+
+        scored.sort(key=lambda item: (item[0], item[1]))
+        return [template for _, _, template in scored]
+
+    def find(self, query: str) -> TemplateConfig | None:
+        if not query.strip():
+            return None
+        matches = self.find_all(query)
+        return matches[0] if matches else None
+
+
+_KEY_RE = re.compile(r"^[A-Za-z0-9_]+$")
 
 STYLE_KEYS = {
     "font",
@@ -694,6 +753,40 @@ def load_templates(
                 log.error("%s", exc)
 
         sort_value = _as_int(template_raw.get("sort", 0), f"templates.{key}.sort")
+
+        # Template and field keys travel inside callback_data and deep links,
+        # both limited by Telegram: only [A-Za-z0-9_] and at most 16 chars.
+        if not _KEY_RE.match(key) or len(key) > 16:
+            message = (
+                f"templates.{key}: ключ бланка длиннее 16 символов — "
+                "он не влезет в кнопку Telegram"
+            )
+            if strict:
+                raise ConfigError(message)
+            warnings.append(message)
+            log.error("%s", message)
+            continue
+        long_fields = [
+            field_key
+            for field_key in fields
+            if len(field_key) > 16 or not _KEY_RE.match(field_key)
+        ]
+        if long_fields:
+            message = (
+                f"templates.{key}: ключи полей длиннее 16 символов: "
+                + ", ".join(long_fields)
+            )
+            if strict:
+                raise ConfigError(message)
+            warnings.append(message)
+            log.error("%s", message)
+            continue
+
+        inline_raw = _mapping(template_raw.get("inline"), f"templates.{key}.inline")
+        keywords_raw = inline_raw.get("keywords", template_raw.get("keywords", [])) or []
+        if not isinstance(keywords_raw, (list, tuple)):
+            keywords_raw = [keywords_raw]
+
         items.append(
             TemplateConfig(
                 key=key,
@@ -704,6 +797,9 @@ def load_templates(
                 fields=fields,
                 note=note,
                 sort=sort_value,
+                inline_title=str(inline_raw.get("title", "")),
+                inline_description=str(inline_raw.get("description", "")),
+                keywords=tuple(str(word) for word in keywords_raw if str(word).strip()),
             )
         )
 
@@ -833,6 +929,27 @@ def required_text_keys() -> Iterable[str]:
         "dm.reload_failed",
         "dm.status",
         "dm.unknown_dm",
+        "inline.result_caption",
+        "inline.result_caption_short",
+        "inline.opening_dm",
+        "inline.progress_caption",
+        "inline.nothing_found_title",
+        "inline.nothing_found_description",
+        "inline.uploading_title",
+        "inline.uploading_description",
+        "dm.sign_prompt",
+        "dm.reply_placeholder",
+        "dm.sign_saved",
+        "dm.sign_complete",
+        "dm.nothing_pending",
+        "dm.link_expired",
+        "dm.prompt_expired",
+        "dm.inline_mode_disabled",
+        "dm.no_modes_enabled",
+        "dm.guest_mode_disabled",
+        "archive.caption",
+        "archive.signer_line",
+        "archive.no_signers",
         "guest.preview_caption",
         "guest.preview_caption_no_description",
         "guest.contract_caption",
